@@ -8,21 +8,30 @@
 #   ko/devtmpfs_lkm-<kmi>.ko
 #   ko/macvlan-<kmi>.ko
 #   ko/ip6table_nat-<kmi>.ko
-#   ko/vgem-<kmi>.ko
+#   ko/vkms-<kmi>.ko
 #
 # 加载顺序有讲究:
 #   1) lkm4ctr       - PID/UTS/IPC namespace, Droidspaces 的硬性前提
 #   2) devtmpfs_lkm  - 注册 devtmpfs (Droidspaces 靠 /proc/filesystems 判断)
 #   3) ip6table_nat  - IPv6 NAT
 #   4) macvlan       - 容器独立局域网 IP
-#   5) vgem          - 虚拟 DRM 设备, 提供 /dev/dri/renderD128
+#   5) vkms          - 虚拟 DRM 设备, 提供 /dev/dri/renderD128
 #
-# vgem 是 anland / wayland 桌面的前提:
-#   Hyprland 和 KWin 的 Wayland 后端要一个可读写的 DRM render node
-#   (hyprland-anland 里有 [[ -r "$ANLAND_DRM_DEVICE" ]] || die)。
-#   厂商内核普遍没开 CONFIG_DRM_VGEM, 只有 card0 (显示控制器), 没有 render
-#   节点。vgem 是内核自带的虚拟 GEM 驱动, 不碰硬件, 只提供 GEM 缓冲分配和
-#   dma-buf 导出, 正好是合成器需要的。insmod 后 renderD128 立即出现。
+# vkms 是 anland / wayland 桌面的前提:
+#   Hyprland 和 KWin 的 Wayland 后端要一个能 gbm_create_device() 的
+#   DRM render node。厂商内核没开 CONFIG_DRM_VGEM / CONFIG_DRM_VKMS,
+#   只有 card0 (display controller), 没有 render 节点。
+#
+#   为什么是 vkms 而不是 vgem: Mesa 的 GBM 后端按 DRM driver 名字找 dri
+#   驱动, 有 vkms_dri.so 却**没有** vgem_dri.so。用 vgem 时 Hyprland 停在
+#     openRenderNode got drm device /dev/dri/renderD128
+#     CRIT: Couldn't open a gbm device   (OpenGL.cpp:351)
+#   vkms 是内核自带的虚拟 KMS 驱动 (card + render + CRTC + plane), 配
+#   kms_swrast_dri.so 就能软件渲染出帧。
+#
+#   本仓库对 vkms 打了一个补丁: 上游 driver_features 只有
+#   MODESET|ATOMIC|GEM, 不建 render node; 加上 DRIVER_RENDER 后才会生成
+#   /dev/dri/renderD128。见 extra/vkms/Makefile 的说明。
 #
 #   必须在容器启动前加载, 否则 Droidspaces 扫描 /dev 时看不到它。
 #
@@ -107,10 +116,10 @@ load_mod lkm4ctr ""
 load_mod devtmpfs_lkm "devtmpfs_probe=2"
 load_mod ip6table_nat ""
 load_mod macvlan ""
-load_mod vgem ""
+load_mod vkms ""
 
 echo "--- lsmod ---" >> "$LOG"
-lsmod | grep -E '^(lkm4ctr|devtmpfs_lkm|ip6table_nat|macvlan|vgem)' >> "$LOG" 2>/dev/null
+lsmod | grep -E '^(lkm4ctr|devtmpfs_lkm|ip6table_nat|macvlan|vkms)' >> "$LOG" 2>/dev/null
 
 echo "--- 能力验证 ---" >> "$LOG"
 unshare -pf true 2>/dev/null \
@@ -123,9 +132,9 @@ grep -q devtmpfs /proc/filesystems 2>/dev/null \
     && echo "[OK] devtmpfs" >> "$LOG" \
     || echo "[--] devtmpfs 未注册" >> "$LOG"
 
-# vgem 提供的 render node: anland / wayland 合成器的前提
+# vkms 提供的 render node: anland / wayland 合成器的前提
 if [ -e /dev/dri/renderD128 ]; then
-    echo "[OK] /dev/dri/renderD128 (vgem)" >> "$LOG"
+    echo "[OK] /dev/dri/renderD128 (vkms)" >> "$LOG"
 else
     echo "[--] /dev/dri/renderD128 缺失 (anland 桌面不可用)" >> "$LOG"
 fi
