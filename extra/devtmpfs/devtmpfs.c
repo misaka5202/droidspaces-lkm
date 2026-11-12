@@ -80,15 +80,15 @@ struct droid_lkm_devtmpfs_ksym {
 	struct dentry *(*lookup_one_len)(const char *name, struct dentry *base, int len);
 	/* namespaced export (VFS_internal_...), so resolved rather than imported */
 	struct dentry *(*dget_parent)(struct dentry *dentry);
-	int (*vfs_mknod)(struct mnt_idmap *idmap, struct inode *dir,
+	int (*vfs_mknod)(void *idmap, struct inode *dir,
 			 struct dentry *dentry, umode_t mode, dev_t dev);
-	int (*vfs_mkdir)(struct mnt_idmap *idmap, struct inode *dir,
+	int (*vfs_mkdir)(void *idmap, struct inode *dir,
 			 struct dentry *dentry, umode_t mode);
-	int (*notify_change)(struct mnt_idmap *idmap, struct dentry *dentry,
+	int (*notify_change)(void *idmap, struct dentry *dentry,
 			     struct iattr *attr, struct inode **delegated_inode);
-	int (*vfs_unlink)(struct mnt_idmap *idmap, struct inode *dir,
+	int (*vfs_unlink)(void *idmap, struct inode *dir,
 			  struct dentry *dentry, struct inode **delegated_inode);
-	int (*vfs_rmdir)(struct mnt_idmap *idmap, struct inode *dir,
+	int (*vfs_rmdir)(void *idmap, struct inode *dir,
 			 struct dentry *dentry);
 	int (*vfs_getattr)(const struct path *path, struct kstat *stat,
 			   u32 request_mask, unsigned int query_flags);
