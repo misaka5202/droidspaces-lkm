@@ -33,7 +33,7 @@ on:
         description: 'lkm4ctr 源码 ref'
         required: false
         type: string
-        default: 'main'
+        default: 'lkm4ctr'
 
 permissions:
   contents: write
@@ -59,8 +59,14 @@ jobs:
           apt-get update -qq || true
           apt-get install -y -qq git ca-certificates || true
           rm -rf /tmp/lkm4ctr
-          git clone --depth=1 --branch "${{ inputs.upstream_ref }}" \
-            https://github.com/cyanmint/lkm4ctr.git /tmp/lkm4ctr
+          # 上游默认分支名是 lkm4ctr (不是 main)。ref 不可用时回退到默认分支,
+          # 避免因分支改名导致整条构建线断掉。
+          if ! git clone --depth=1 --branch "${{ inputs.upstream_ref }}" \
+                 https://github.com/cyanmint/lkm4ctr.git /tmp/lkm4ctr 2>/dev/null; then
+            echo "::warning::ref '${{ inputs.upstream_ref }}' 拉取失败, 改用默认分支"
+            rm -rf /tmp/lkm4ctr
+            git clone --depth=1 https://github.com/cyanmint/lkm4ctr.git /tmp/lkm4ctr
+          fi
           echo ">>> HEAD: $(git -C /tmp/lkm4ctr rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
       - name: 确认 DDK 环境
