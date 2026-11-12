@@ -111,6 +111,11 @@ jobs:
       - name: 打包 KernelSU 模块
         run: |
           set -euo pipefail
+          # DDK 镜像精简, 不自带 zip
+          command -v zip >/dev/null 2>&1 || {
+            apt-get update -qq && apt-get install -y -qq zip unzip
+          }
+
           STAGE="$GITHUB_WORKSPACE/ksu_module"
           rm -rf "$STAGE"
           mkdir -p "$STAGE"
