@@ -8,7 +8,7 @@
 # 该源码针对 6.12, 这里做了 6.1 适配: 见 compat_61.h (mnt_idmap -> user_namespace)
 
 obj-m := devtmpfs_lkm.o
-devtmpfs_lkm-y := devtmpfs.o \
+devtmpfs_lkm-y := devtmpfs.o license.o \
 	hk/hk_inline.o \
 	kr/core.o kr/access.o kr/discover.o kr/symbol.o kr/slide.o \
 	kr/fastboot.o kr/hint.o kr/variant.o kr/anchor.o

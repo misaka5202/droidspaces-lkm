@@ -33,7 +33,7 @@ loaded_any=0
 #   3) macvlan      - 网络设备驱动
 #
 # 每个都是独立的, 任何一个失败不影响其他, 也不影响开机。
-for ko in "$MODDIR"/lkm4ctr.ko "$MODDIR"/ip6table_nat.ko "$MODDIR"/macvlan.ko; do
+for ko in "$MODDIR"/lkm4ctr.ko "$MODDIR"/devtmpfs_lkm.ko "$MODDIR"/ip6table_nat.ko "$MODDIR"/macvlan.ko; do
     [ -f "$ko" ] || continue
     name=$(basename "$ko" .ko)
 
@@ -80,7 +80,7 @@ unshare -i true 2>/dev/null \
 
 # 网络模块状态 (供 Droidspaces 判断 macvlan / NAT66 是否可用)
 echo "--- 网络模块 ---" >> "$LOG"
-for m in macvlan ip6table_nat; do
+for m in devtmpfs_lkm macvlan ip6table_nat; do
     if grep -q "^${m} " /proc/modules 2>/dev/null; then
         echo "[OK] $m" >> "$LOG"
     else
