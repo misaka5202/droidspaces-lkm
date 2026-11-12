@@ -3,4 +3,4 @@ name=Droidspaces LKM
 version=1.0.0
 versionCode=10000
 author=misaka5202
-description=在原始 GKI 内核上补齐 Droidspaces 容器能力: PID/IPC namespace、devtmpfs、macvlan、IPv6 NAT。按 KMI 自动选择模块，无需重编内核。日志: /data/local/tmp/droidspaces-lkm.log
+description=在原始 GKI 内核上补齐 Droidspaces 容器能力
