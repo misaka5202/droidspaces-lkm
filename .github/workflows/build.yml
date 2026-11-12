@@ -69,6 +69,19 @@ jobs:
           fi
           echo ">>> HEAD: $(git -C /tmp/lkm4ctr rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
+          # 应用本地补丁: 让 /proc/<pid>/ns/user 在 CONFIG_USER_NS=n 的内核上也出现。
+          # 这是 Sandboxing 检查项要的东西, 见 patches/0001-expose-ns-user.patch。
+          if [ -d "$GITHUB_WORKSPACE/patches" ]; then
+            for p in "$GITHUB_WORKSPACE"/patches/*.patch; do
+              [ -f "$p" ] || continue
+              echo ">>> 应用 $(basename "$p")"
+              git -C /tmp/lkm4ctr apply -v "$p" || {
+                echo "::error::补丁应用失败: $(basename "$p")"
+                exit 1
+              }
+            done
+          fi
+
       - name: 确认 DDK 环境
         run: |
           set -euxo pipefail

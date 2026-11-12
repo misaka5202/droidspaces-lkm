@@ -1,0 +1,67 @@
+From afd47f2c0b94c548fca1bbeea467df6462d085c7 Mon Sep 17 00:00:00 2001
+From: misaka5202 <misaka5202@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 22:29:53 +0800
+Subject: [PATCH] procfs: expose /proc/<pid>/ns/user on kernels without
+ CONFIG_USER_NS
+
+fs/proc/namespaces.c builds ns_entries[] with &userns_operations guarded by
+#ifdef CONFIG_USER_NS, so on a kernel built without it the user entry is not
+in the array at all and proc_ns_dir_lookup returns ENOENT no matter how many
+real user_namespace objects vendor_kernel creates.
+
+vendor_kernel already does exactly this for ipc and pid: the
+proc_ns_dir_lookup hook retries the missing component and calls the kernel's
+own proc_ns_instantiate(), producing a genuine procfs symlink rather than a
+fabricated stat result.
+
+Add user the same way, reusing vns_userns_operations (already defined in
+vendor/kernel/user_namespace.c) and taking native availability from
+vns_native_userns_core_available(), so a kernel that really has userns keeps
+its own entry.
+
+This matters because tools probe access("/proc/self/ns/user", F_OK) -- that
+is how Droidspaces decides Sandboxing is available, and it is currently the
+one entry of the three still-missing checks that can be made real.
+---
+ glue/vendor_kernel_procfs.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/glue/vendor_kernel_procfs.c b/glue/vendor_kernel_procfs.c
+index c445664..05bf20d 100644
+--- a/glue/vendor_kernel_procfs.c
++++ b/glue/vendor_kernel_procfs.c
+@@ -55,6 +55,15 @@
+ 
+ #define VNS_PROC_NS_IPC_NAME	"ipc"
+ #define VNS_PROC_NS_PID_NAME	"pid"
++/*
++ * user 条目同样受 #ifdef CONFIG_USER_NS 保护:
++ * fs/proc/namespaces.c 的 ns_entries[] 里 &userns_operations 那一项
++ * 在 CONFIG_USER_NS=n 时根本不进数组, 于是 /proc/<pid>/ns/user 永远
++ * 不出现 —— 即使 vendor_kernel 已经建出真实的 user_namespace 对象。
++ * Droidspaces 之类的工具用 access("/proc/self/ns/user", F_OK) 判断
++ * 沙箱能力, 缺这一项就被判为不可用。
++ */
++#define VNS_PROC_NS_USER_NAME	"user"
+ 
+ typedef struct dentry *(*vns_proc_ns_instantiate_fn_t)(struct dentry *,
+ 						       struct task_struct *,
+@@ -542,6 +551,15 @@ static struct dentry *vendor_kernel_hook_proc_ns_dir_lookup(
+ 			   dentry->d_name.len)) {
+ 		native = READ_ONCE(vns_pidns_runtime_supported);
+ 		ns_ops = &vns_pidns_operations;
++	} else if (dentry->d_name.len == strlen(VNS_PROC_NS_USER_NAME) &&
++		   !memcmp(dentry->d_name.name, VNS_PROC_NS_USER_NAME,
++			   dentry->d_name.len)) {
++		/*
++		 * 目标内核本来是原生支持 userns 的, 就让原生条目生效,
++		 * 不要用 vendored 对象去覆盖它。
++		 */
++		native = vns_native_userns_core_available();
++		ns_ops = &vns_userns_operations;
+ 	} else {
+ 		return res;
+ 	}
+-- 
+2.54.0.windows.1
+
