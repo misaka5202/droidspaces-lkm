@@ -51,6 +51,9 @@ jobs:
       matrix: ${{ steps.set.outputs.matrix }}
       ddk_release: ${{ steps.set.outputs.ddk_release }}
     steps:
+      - name: 检出
+        uses: actions/checkout@v6
+
       - name: Compute KMI matrix
         id: set
         env:
@@ -198,9 +201,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          find ko-all -name '*.ko' -exec cp -v {} dist/ \;
+          if [ -d ko-all ]; then
+            find ko-all -name '*.ko' -exec cp -v {} dist/ \;
+          else
+            echo "::warning::没有下载到任何 ko"
+          fi
           echo "=== dist ==="
-          ls -lh dist/
+          ls -lh dist/ || true
 
       - name: 生成源码快照 (GPL-2.0 要求)
         run: |
