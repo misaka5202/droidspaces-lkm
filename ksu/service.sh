@@ -27,9 +27,13 @@ echo "kernel: $(uname -r)" >> "$LOG"
 
 loaded_any=0
 
-# 逐个加载目录内所有 ko。
-# lkm4ctr 放第一个: 它提供 namespace, 其他模块可能依赖。
-for ko in "$MODDIR"/lkm4ctr.ko "$MODDIR"/macvlan.ko "$MODDIR"/ip6table_nat.ko; do
+# 加载顺序有讲究:
+#   1) lkm4ctr      - 提供 namespace, 是 Droidspaces 的硬性前提
+#   2) ip6table_nat - netfilter 模块, 依赖内核已有的 nf_nat 等符号
+#   3) macvlan      - 网络设备驱动
+#
+# 每个都是独立的, 任何一个失败不影响其他, 也不影响开机。
+for ko in "$MODDIR"/lkm4ctr.ko "$MODDIR"/ip6table_nat.ko "$MODDIR"/macvlan.ko; do
     [ -f "$ko" ] || continue
     name=$(basename "$ko" .ko)
 
@@ -73,5 +77,15 @@ unshare -pf true 2>/dev/null \
 unshare -i true 2>/dev/null \
     && echo "[OK] IPC namespace 可用" >> "$LOG" \
     || echo "[FAIL] IPC namespace 不可用" >> "$LOG"
+
+# 网络模块状态 (供 Droidspaces 判断 macvlan / NAT66 是否可用)
+echo "--- 网络模块 ---" >> "$LOG"
+for m in macvlan ip6table_nat; do
+    if grep -q "^${m} " /proc/modules 2>/dev/null; then
+        echo "[OK] $m" >> "$LOG"
+    else
+        echo "[--] $m 未加载 (对应功能不可用, 不影响容器启动)" >> "$LOG"
+    fi
+done
 
 exit 0

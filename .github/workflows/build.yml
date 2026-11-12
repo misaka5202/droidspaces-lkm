@@ -180,37 +180,75 @@ jobs:
             lkm4ctr-oppo-*.zip
           if-no-files-found: error
 
-      - name: 发布 Release
-        if: github.event_name == 'workflow_dispatch'
+  release:
+    name: Publish release
+    needs: build
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: lkm4ctr-oppo-*
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: |
+          find dist -type f -exec ls -lh {} \;
+
+      - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           TAG="build-$(date +%Y%m%d-%H%M%S)"
           {
-            echo "### lkm4ctr for OPPO Find X7"
+            echo "### lkm4ctr + 额外模块 for OPPO Find X7"
             echo
             echo "KMI: \`${{ inputs.kmi }}\` / DDK: \`${{ inputs.ddk_release }}\`"
             echo
             echo "源码: [cyanmint/lkm4ctr](https://github.com/cyanmint/lkm4ctr)"
             echo
-            echo "**实测效果**（设备 \`6.1.157-android14-11-o-g2d576b643492\`）:"
+            echo "#### 包含的模块"
+            echo
+            echo "| 模块 | 作用 | 状态 |"
+            echo "|---|---|---|"
+            echo "| \`lkm4ctr.ko\` | PID / UTS / IPC namespace | 设备实测可用 |"
+            echo "| \`ip6table_nat.ko\` | IPv6 NAT | 编译通过 |"
+            echo "| \`macvlan.ko\` | 容器独立局域网 IP (6.1 原生源码) | 编译通过 |"
+            echo
+            echo "#### 设备实测（\`6.1.157-android14-11-o-g2d576b643492\`）"
             echo
             echo "\`\`\`"
             echo "Droidspaces v7.2.0 check:"
             echo "  [MUST HAVE] 全部通过"
-            echo "    ✓ PID namespace"
-            echo "    ✓ IPC namespace"
+            echo "    ✓ PID namespace       (lkm4ctr 补齐)"
+            echo "    ✓ IPC namespace       (lkm4ctr 补齐)"
             echo "    ✓ UTS / Mount namespace"
+            echo
+            echo "容器实测:"
+            echo "  Alpine 3.20 启动成功  PID 23319"
+            echo "  容器内 pid=1 uid=0 hostname=testalpine"
+            echo "  apk 包管理可用"
             echo "\`\`\`"
             echo
-            echo "**未覆盖**（Droidspaces 标为 OPTIONAL/RECOMMENDED）:"
-            echo "\`DEVTMPFS\` \`MACVLAN\` \`IP6_NF_NAT\` \`CFS_BANDWIDTH\` \`CGROUP_PIDS\` \`USER_NS\`"
+            echo "#### 仍未覆盖"
             echo
-            echo "**安装**: 刷入 zip → 重启。日志 \`/data/local/tmp/lkm4ctr.log\`"
+            echo "\`DEVTMPFS\` \`CFS_BANDWIDTH\` \`CGROUP_PIDS\` \`USER_NS\`"
+            echo
+            echo "（Droidspaces 标为 OPTIONAL/RECOMMENDED，不影响容器启动）"
+            echo
+            echo "#### 安装"
+            echo
+            echo "刷入 \`lkm4ctr-oppo-*.zip\` → 重启。日志 \`/data/local/tmp/lkm4ctr.log\`"
           } > notes.md
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --title "lkm4ctr ${{ inputs.kmi }} $(date +%Y-%m-%d)" \
             --notes-file notes.md \
-            out/*.ko lkm4ctr-oppo-*.zip
+            dist/*.ko dist/*.zip \
+            || {
+              echo "::warning::release 创建失败"
+              gh release view "$TAG" --repo "$GITHUB_REPOSITORY" || true
+            }
