@@ -1,36 +1,37 @@
-name: build lkm4ctr for OPPO Find X7 (android14-6.1)
+name: build Droidspaces LKM
 
-# 为 OPPO Find X7 (MT6989) 构建 lkm4ctr.ko, 并打包成 KernelSU 模块。
+# 为全部支持的 arm64 GKI KMI 构建 Droidspaces 所需的可加载模块，
+# 并打包成按 KMI 自动选择的 KernelSU 模块。
 #
-# 目的: 在**不刷内核**的前提下让 Droidspaces 跑起来。
-#
-# 设备情况 (6.1.157-android14-11-o-g2d576b643492, KMI android14-6.1):
-#   缺  CONFIG_PID_NS / SYSVIPC / DEVTMPFS / USER_NS 等
-#   有  CONFIG_KPROBES=y (lkm4ctr 的 kprobe 后端依赖)
-#
-# 实测结果 (2026-11-12, run 43175535973 的产物上机):
-#   Droidspaces v7.2.0 check -> [MUST HAVE] 全部通过
-#   仍未覆盖: DEVTMPFS / MACVLAN / IP6_NF_NAT / CFS_BANDWIDTH /
-#             CGROUP_PIDS / USER_NS (均为 OPTIONAL 或 RECOMMENDED)
+# 产物:
+#   lkm4ctr-<kmi>.ko        命名空间 (PID/UTS/IPC/SYSVIPC/POSIX_MQUEUE)
+#   devtmpfs_lkm-<kmi>.ko   注册 devtmpfs 文件系统
+#   macvlan-<kmi>.ko        容器独立局域网 IP
+#   ip6table_nat-<kmi>.ko   IPv6 NAT
+#   droidspaces-lkm-<kmi>-arm64.zip   单 KMI 的模块包
+#   droidspaces-lkm-arm64.zip         全 KMI 合并包, 开机按 osrelease 自动选
+#   source-<tag>.tar.gz               对应源码快照 (GPL-2.0 要求)
 #
 # 构建用 SukiSU-Ultra 的 DDK 容器, 内含该 KMI 真实的
 # vmlinux + Module.symvers + 匹配的 clang 工具链。
+# 比 git clone kernel/common + gki_defconfig + modules_prepare 可靠得多,
+# 后者只有 stub/空的符号 CRC, 会导致 modpost 报未解析核心符号。
 
 on:
   workflow_dispatch:
     inputs:
-      kmi:
-        description: 'KMI'
+      kmis:
+        description: '逗号分隔的 KMI 列表, 留空=全部'
         required: false
         type: string
-        default: 'android14-6.1'
+        default: ''
       ddk_release:
         description: 'DDK 镜像 release 标签'
         required: false
         type: string
         default: '20260828'
       upstream_ref:
-        description: 'lkm4ctr 源码 ref'
+        description: 'lkm4ctr 上游 ref'
         required: false
         type: string
         default: 'lkm4ctr'
@@ -40,237 +41,277 @@ permissions:
 
 env:
   TZ: Asia/Shanghai
+  DEFAULT_KMIS: 'android12-5.10,android13-5.10,android13-5.15,android14-5.15,android14-6.1,android15-6.6,android16-6.12'
 
 jobs:
+  prepare:
+    name: Prepare matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+      ddk_release: ${{ steps.set.outputs.ddk_release }}
+    steps:
+      - name: Compute KMI matrix
+        id: set
+        env:
+          REQUESTED: ${{ inputs.kmis }}
+        run: |
+          set -euo pipefail
+          kmis="${REQUESTED:-$DEFAULT_KMIS}"
+          json=$(python3 scripts/make_matrix.py "$kmis")
+          echo "matrix=$json" >> "$GITHUB_OUTPUT"
+          echo "ddk_release=${{ inputs.ddk_release }}" >> "$GITHUB_OUTPUT"
+          echo "KMI 列表: $kmis"
+
   build:
-    name: Build lkm4ctr.ko (${{ inputs.kmi }})
+    name: Build (${{ matrix.kmi }})
+    needs: prepare
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/ylarod/ddk-min:${{ inputs.kmi }}-${{ inputs.ddk_release }}
-    timeout-minutes: 60
+      image: ghcr.io/ylarod/ddk-min:${{ matrix.kmi }}-${{ needs.prepare.outputs.ddk_release }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
 
     steps:
-      - name: 检出本仓库
+      - name: 检出
         uses: actions/checkout@v6
 
-      - name: 拉取 lkm4ctr 源码
+      - name: 拉取上游源码并打补丁
         run: |
           set -euxo pipefail
-          apt-get update -qq || true
-          apt-get install -y -qq git ca-certificates || true
+          command -v git >/dev/null || { apt-get update -qq && apt-get install -y -qq git ca-certificates; }
           rm -rf /tmp/lkm4ctr
-          # 上游默认分支名是 lkm4ctr (不是 main)。ref 不可用时回退到默认分支,
-          # 避免因分支改名导致整条构建线断掉。
           if ! git clone --depth=1 --branch "${{ inputs.upstream_ref }}" \
                  https://github.com/cyanmint/lkm4ctr.git /tmp/lkm4ctr 2>/dev/null; then
-            echo "::warning::ref '${{ inputs.upstream_ref }}' 拉取失败, 改用默认分支"
-            rm -rf /tmp/lkm4ctr
             git clone --depth=1 https://github.com/cyanmint/lkm4ctr.git /tmp/lkm4ctr
           fi
-          echo ">>> HEAD: $(git -C /tmp/lkm4ctr rev-parse --short HEAD 2>/dev/null || echo unknown)"
-
-          # 应用本地补丁: 让 /proc/<pid>/ns/user 在 CONFIG_USER_NS=n 的内核上也出现。
-          # 这是 Sandboxing 检查项要的东西, 见 patches/0001-expose-ns-user.patch。
+          echo ">>> upstream HEAD: $(git -C /tmp/lkm4ctr rev-parse --short HEAD)"
+          # 本地补丁 (若有)
           if [ -d "$GITHUB_WORKSPACE/patches" ]; then
             for p in "$GITHUB_WORKSPACE"/patches/*.patch; do
               [ -f "$p" ] || continue
               echo ">>> 应用 $(basename "$p")"
-              git -C /tmp/lkm4ctr apply -v "$p" || {
-                echo "::error::补丁应用失败: $(basename "$p")"
-                exit 1
-              }
+              git -C /tmp/lkm4ctr apply -v "$p"
             done
           fi
 
-      - name: 确认 DDK 环境
+      - name: 编译四个模块
+        env:
+          KMI: ${{ matrix.kmi }}
         run: |
           set -euxo pipefail
-          KDIR="/opt/ddk/kdir/${{ inputs.kmi }}"
-          test -d "$KDIR" || { echo "::error::DDK 目录不存在: $KDIR"; ls /opt/ddk/kdir 2>/dev/null || true; exit 1; }
-          echo ">>> KDIR=$KDIR"
-          test -s "$KDIR/Module.symvers" && echo ">>> Module.symvers: $(wc -l < "$KDIR/Module.symvers") 条"
+          KDIR="/opt/ddk/kdir/$KMI"
+          test -d "$KDIR" || { echo "::error::DDK 目录不存在: $KDIR"; ls /opt/ddk/kdir; exit 1; }
 
-      - name: 编译 lkm4ctr.ko
-        run: |
-          set -euxo pipefail
-          KDIR="/opt/ddk/kdir/${{ inputs.kmi }}"
-          ROOT="/tmp/lkm4ctr/vendor"
-          test -f "$ROOT/Makefile" || { echo "::error::vendor/Makefile 不存在"; ls "$ROOT"; exit 1; }
-          make -C "$KDIR" M="$ROOT" LKM4CTR_LOG_DMESG=y modules -j"$(nproc)"
-          mkdir -p "$GITHUB_WORKSPACE/out"
-          find "$ROOT" -name '*.ko' -exec cp -v {} "$GITHUB_WORKSPACE/out/" \;
-          ls -lh "$GITHUB_WORKSPACE/out"
+          OUT="$GITHUB_WORKSPACE/out"
+          mkdir -p "$OUT"
 
-      - name: 编译额外模块 (macvlan / ip6nat / pids)
-        continue-on-error: true
-        run: |
-          set -uxo pipefail
-          KDIR="/opt/ddk/kdir/${{ inputs.kmi }}"
-          mkdir -p "$GITHUB_WORKSPACE/out"
+          # 1) lkm4ctr
+          make -C "$KDIR" M=/tmp/lkm4ctr/vendor LKM4CTR_LOG_DMESG=y modules -j"$(nproc)"
+          cp /tmp/lkm4ctr/vendor/lkm4ctr.ko "$OUT/lkm4ctr-$KMI.ko"
 
-          # 这些模块来自 ai-luo2006/droidspaces-6.12-pmb110, 原本针对
-          # android16-6.12。在 6.1 上大概率编不过, 但 continue-on-error
-          # 让失败不影响主模块产物, 同时暴露真实错误用于后续适配。
-          for m in net_macvlan_61 net_ip6nat devtmpfs net_macvlan; do
+          # 2-4) 额外模块。任何一个失败只跳过, 不中断整条矩阵 ——
+          #      这是为了让能编的 KMI 尽量产出可用包。
+          for m in net_macvlan_61 net_ip6nat devtmpfs; do
             SRC="$GITHUB_WORKSPACE/extra/$m"
-            [ -f "$SRC/Makefile" ] || { echo "::warning::$m 无 Makefile, 跳过"; continue; }
+            [ -f "$SRC/Makefile" ] || { echo "::warning::$m 无 Makefile"; continue; }
             echo "=============================================="
-            echo ">>> 编译 $m"
+            echo ">>> $m @ $KMI"
             echo "=============================================="
             if make -C "$KDIR" M="$SRC" modules -j"$(nproc)"; then
-              find "$SRC" -maxdepth 1 -name '*.ko' -exec cp -v {} "$GITHUB_WORKSPACE/out/" \;
+              case "$m" in
+                net_macvlan_61) cp "$SRC"/macvlan.ko "$OUT/macvlan-$KMI.ko" ;;
+                net_ip6nat)     cp "$SRC"/ip6table_nat.ko "$OUT/ip6table_nat-$KMI.ko" ;;
+                devtmpfs)       cp "$SRC"/devtmpfs_lkm.ko "$OUT/devtmpfs_lkm-$KMI.ko" ;;
+              esac
               echo "    [OK] $m"
             else
-              echo "    [FAIL] $m 编译失败 (预期内, 见上方错误)"
+              echo "    [FAIL] $m @ $KMI (跳过)"
             fi
+            # 清掉中间产物, 避免污染下一个模块
+            find "$SRC" -name '*.o' -delete 2>/dev/null || true
+            find "$SRC" -name '.*.cmd' -delete 2>/dev/null || true
           done
 
-          echo "=== 当前 out/ 内容 ==="
-          ls -lh "$GITHUB_WORKSPACE/out"
+          echo "=== 产物 ==="
+          ls -lh "$OUT"
 
-      - name: 校验 ko
+      - name: 校验
+        env:
+          KMI: ${{ matrix.kmi }}
         run: |
-          set -euo pipefail
-          KDIR="/opt/ddk/kdir/${{ inputs.kmi }}"
-          for f in "$GITHUB_WORKSPACE"/out/*.ko; do
+          set -uo pipefail
+          KDIR="/opt/ddk/kdir/$KMI"
+          OUT="$GITHUB_WORKSPACE/out"
+          FAIL=0
+          for f in "$OUT"/*.ko; do
             [ -f "$f" ] || continue
-            echo "=== $(basename "$f") ==="
-            VM=$(modinfo -F vermagic "$f" 2>/dev/null || strings "$f" | grep -m1 'vermagic=' | sed 's/vermagic=//')
-            echo "  vermagic : $VM"
+            n=$(basename "$f")
+            echo "=== $n ==="
+            vm=$(modinfo -F vermagic "$f" 2>/dev/null || strings "$f" | grep -m1 'vermagic=' | sed 's/vermagic=//')
+            echo "  vermagic : $vm"
             echo "  大小     : $(du -h "$f" | cut -f1)"
-            # struct module 尺寸决定 ABI 是否匹配: 设备上所有厂商 ko 都是 1088 (0x440)
-            TM=$(readelf -SW "$f" 2>/dev/null | awk '/this_module/{print $6; exit}')
-            if [ -n "$TM" ]; then
-              echo "  this_module: 0x$TM = $((16#$TM)) 字节"
-              [ "$((16#$TM))" -eq 1088 ] && echo "    OK 与设备 1088 一致" || echo "    ::warning::与设备 1088 不符"
+            # struct module 尺寸: 设备上厂商 ko 统一 1088 (0x440)
+            tm=$(readelf -SW "$f" 2>/dev/null | awk '/this_module/{print $6; exit}')
+            if [ -n "$tm" ]; then
+              dec=$((16#$tm))
+              echo "  this_module: 0x$tm = $dec 字节"
+              [ "$dec" -eq 1088 ] || echo "  ::warning::与 1088 不同, 设备可能拒绝加载"
             fi
-            VS=$(readelf -SW "$f" 2>/dev/null | awk '/__versions/{print $6; exit}')
-            [ -n "$VS" ] && echo "  __versions: $((16#$VS)) 字节"
+            # 入口符号
+            if readelf -sW "$f" 2>/dev/null | grep -qw init_module; then
+              echo "  init_module: OK"
+            else
+              echo "  ::error::$n 缺少 init_module, insmod 会报 ENOENT"
+              FAIL=1
+            fi
           done
+          exit $FAIL
 
-      - name: 打包 KernelSU 模块
-        run: |
-          set -euo pipefail
-          # DDK 镜像精简, 不自带 zip
-          command -v zip >/dev/null 2>&1 || {
-            apt-get update -qq && apt-get install -y -qq zip unzip
-          }
-
-          STAGE="$GITHUB_WORKSPACE/ksu_module"
-          rm -rf "$STAGE"
-          mkdir -p "$STAGE"
-
-          # 收集 out/ 下全部 ko (主模块 + 额外模块)
-          for k in "$GITHUB_WORKSPACE"/out/*.ko; do
-            [ -f "$k" ] && cp -v "$k" "$STAGE/"
-          done
-          [ -n "$(ls -A "$STAGE"/*.ko 2>/dev/null)" ] || { echo "::error::没有任何 ko"; exit 1; }
-          cp ksu/module.prop    "$STAGE/"
-          cp ksu/service.sh     "$STAGE/"
-          cp ksu/customize.sh   "$STAGE/"
-          cp ksu/uninstall.sh   "$STAGE/"
-          cp ksu/action.sh      "$STAGE/"
-          chmod 755 "$STAGE"/*.sh
-
-          # 脚本必须 LF 换行, 否则 Android 的 sh 会报 "No such file or directory"
-          sed -i 's/\r$//' "$STAGE"/*.sh "$STAGE/module.prop"
-
-          cd "$STAGE"
-          ZIP="$GITHUB_WORKSPACE/lkm4ctr-oppo-$(date +%Y%m%d).zip"
-          rm -f "$ZIP"
-          zip -qr9 "$ZIP" .
-          cd "$GITHUB_WORKSPACE"
-          echo ">>> $ZIP ($(du -h "$ZIP" | cut -f1))"
-          unzip -l "$ZIP"
-          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
-
-      - name: 上传产物
+      - name: 上传
+        if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: lkm4ctr-oppo-${{ inputs.kmi }}
-          path: |
-            out/*.ko
-            lkm4ctr-oppo-*.zip
-          if-no-files-found: error
+          name: ko-${{ matrix.kmi }}
+          path: out/
+          if-no-files-found: warn
 
-  release:
-    name: Publish release
-    needs: build
-    if: github.event_name == 'workflow_dispatch'
+  package:
+    name: Package
+    needs: [prepare, build]
+    if: always() && needs.build.result != 'cancelled'
     runs-on: ubuntu-latest
     steps:
-      - name: Download build artifacts
+      - name: 检出
+        uses: actions/checkout@v6
+
+      - name: 下载所有产物
         uses: actions/download-artifact@v8
         with:
-          pattern: lkm4ctr-oppo-*
-          path: dist
+          pattern: ko-*
+          path: ko-all
           merge-multiple: true
 
-      - name: List artifacts
+      - name: 整理
         run: |
-          find dist -type f -exec ls -lh {} \;
+          set -euo pipefail
+          mkdir -p dist
+          find ko-all -name '*.ko' -exec cp -v {} dist/ \;
+          echo "=== dist ==="
+          ls -lh dist/
 
-      - name: Create release
+      - name: 生成源码快照 (GPL-2.0 要求)
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/src
+          mkdir -p /tmp/src
+          if git clone --depth=1 --branch "${{ inputs.upstream_ref }}" \
+               https://github.com/cyanmint/lkm4ctr.git /tmp/src/lkm4ctr 2>/dev/null; then
+            :
+          else
+            git clone --depth=1 https://github.com/cyanmint/lkm4ctr.git /tmp/src/lkm4ctr
+          fi
+          if [ -d patches ]; then
+            for p in patches/*.patch; do
+              [ -f "$p" ] && git -C /tmp/src/lkm4ctr apply "PWD/$p" 2>/dev/null || true
+            done
+          fi
+          cp -a extra /tmp/src/extra
+          cp -a ksu /tmp/src/ksu
+          cp README.md /tmp/src/ 2>/dev/null || true
+          tar czf dist/source-$(date +%Y%m%d).tar.gz -C /tmp/src .
+          ls -lh dist/source-*.tar.gz
+
+      - name: 构建 KernelSU 模块
+        run: |
+          set -euo pipefail
+          command -v zip >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq zip unzip; }
+
+          STAGE="$RUNNER_TEMP/ksu"
+          rm -rf "$STAGE"; mkdir -p "$STAGE/ko"
+
+          cp dist/*.ko "$STAGE/ko/"
+          cp ksu/module.prop ksu/service.sh ksu/customize.sh ksu/uninstall.sh ksu/action.sh "$STAGE/"
+          chmod 755 "$STAGE"/*.sh
+          sed -i 's/\r$//' "$STAGE"/*.sh "$STAGE/module.prop"
+
+          # 全 KMI 合并包
+          ( cd "$STAGE" && zip -qr9 "$GITHUB_WORKSPACE/dist/droidspaces-lkm-arm64.zip" . )
+          echo "=== 合并包内容 ==="
+          unzip -l "$GITHUB_WORKSPACE/dist/droidspaces-lkm-arm64.zip"
+
+          # 按 KMI 拆分单包
+          for f in dist/*.ko; do
+            [ -f "$f" ] || continue
+            kmi=$(basename "$f" | sed -E 's/^(lkm4ctr|devtmpfs_lkm|macvlan|ip6table_nat)-(.*)\.ko$/\2/')
+            case "$kmi" in
+              android*) ;;
+              *) continue ;;
+            esac
+            S="$RUNNER_TEMP/one-$kmi"
+            rm -rf "$S"; mkdir -p "$S/ko"
+            cp dist/*-"$kmi".ko "$S/ko/"
+            cp ksu/module.prop ksu/service.sh ksu/customize.sh ksu/uninstall.sh ksu/action.sh "$S/"
+            chmod 755 "$S"/*.sh
+            sed -i 's/\r$//' "$S"/*.sh "$S/module.prop"
+            ( cd "$S" && zip -qr9 "$GITHUB_WORKSPACE/dist/droidspaces-lkm-$kmi-arm64.zip" . )
+          done
+
+          echo "=== 最终 dist ==="
+          ls -lh dist/
+
+      - name: 上传
+        uses: actions/upload-artifact@v7
+        with:
+          name: droidspaces-lkm-dist
+          path: dist/
+          if-no-files-found: error
+
+      - name: 发布 Release
+        if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          TAG="build-$(date +%Y%m%d-%H%M%S)"
+          TAG="v$(date +%Y%m%d-%H%M%S)"
           {
-            echo "### lkm4ctr + 额外模块 for OPPO Find X7"
+            echo "在原始 GKI 内核上补齐 Droidspaces 所需的容器能力，无需重编内核。"
             echo
-            echo "KMI: \`${{ inputs.kmi }}\` / DDK: \`${{ inputs.ddk_release }}\`"
+            echo "### 包含的模块"
             echo
-            echo "源码: [cyanmint/lkm4ctr](https://github.com/cyanmint/lkm4ctr)"
+            echo '| 模块 | 作用 | 补齐的 CONFIG |'
+            echo '|---|---|---|'
+            echo '| `lkm4ctr` | 命名空间核心 | `PID_NS` `UTS_NS` `IPC_NS` `SYSVIPC` `POSIX_MQUEUE` |'
+            echo '| `devtmpfs_lkm` | 注册 devtmpfs | `DEVTMPFS` |'
+            echo '| `macvlan` | 容器独立 IP | `MACVLAN` |'
+            echo '| `ip6table_nat` | IPv6 NAT | `IP6_NF_NAT` `IP6_NF_TARGET_MASQUERADE` |'
             echo
-            echo "#### 包含的模块"
+            echo "### 安装"
             echo
-            echo "| 模块 | 作用 | 状态 |"
-            echo "|---|---|---|"
-            echo "| \`lkm4ctr.ko\` | PID / UTS / IPC namespace | 设备实测可用 |"
-            echo "| \`ip6table_nat.ko\` | IPv6 NAT | 编译通过 |"
-            echo "| \`macvlan.ko\` | 容器独立局域网 IP (6.1 原生源码) | 编译通过 |"
+            echo '刷入 `droidspaces-lkm-arm64.zip`（全 KMI）或 `droidspaces-lkm-<kmi>-arm64.zip`（单 KMI），重启。'
             echo
-            echo "#### 设备实测（\`6.1.157-android14-11-o-g2d576b643492\`）"
+            echo '手动加载时 `devtmpfs_lkm` 请带 `devtmpfs_probe=2`：'
             echo
-            echo "\`\`\`"
-            echo "Droidspaces v7.2.0 check:"
-            echo "  [MUST HAVE] 全部通过"
-            echo "    ✓ PID namespace       (lkm4ctr 补齐)"
-            echo "    ✓ IPC namespace       (lkm4ctr 补齐)"
-            echo "    ✓ UTS / Mount namespace"
+            echo '```sh'
+            echo 'insmod devtmpfs_lkm-<kmi>.ko devtmpfs_probe=2'
+            echo '```'
             echo
-            echo "容器实测:"
-            echo "  Alpine 3.20 启动成功  PID 23319"
-            echo "  容器内 pid=1 uid=0 hostname=testalpine"
-            echo "  apk 包管理可用"
-            echo "\`\`\`"
+            echo "### 未覆盖"
             echo
-            echo "#### 仍未覆盖"
+            echo '`CFS_BANDWIDTH` `CGROUP_PIDS` `USER_NS` —— 均需内核编译期支持，无法在运行时补。'
             echo
-            echo "\`DEVTMPFS\` \`CFS_BANDWIDTH\` \`CGROUP_PIDS\` \`USER_NS\`"
+            echo "### 源码"
             echo
-            echo "（Droidspaces 标为 OPTIONAL/RECOMMENDED，不影响容器启动）"
+            echo 'GPL-2.0 要求随二进制提供源码，见 `source-*.tar.gz`。'
             echo
-            echo "#### 安装"
+            echo "### 免责"
             echo
-            echo "刷入 \`lkm4ctr-oppo-*.zip\` → 重启。日志 \`/data/local/tmp/lkm4ctr.log\`"
+            echo '加载内核模块等同以最高权限执行内核代码。请确保有 fastboot / recovery 恢复手段。'
           } > notes.md
-          # 产物实际落在 dist/out/ 下 (download-artifact 保留了 out/ 前缀),
-          # 直接写 dist/*.ko 匹配不到任何文件, gh 会失败。
-          # 用 find 收集所有 ko 和 zip, 避免路径假设。
-          mapfile -t FILES < <(find dist -type f \( -name '*.ko' -o -name '*.zip' \) | sort)
-          echo "将上传 ${#FILES[@]} 个文件:"
-          printf '  %s\n' "${FILES[@]}"
-
-          if [ "${#FILES[@]}" -eq 0 ]; then
-            echo "::error::没有可发布的产物"
-            exit 1
-          fi
-
-          # 不再吞掉错误: 发布失败就是失败, 便于发现
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "lkm4ctr ${{ inputs.kmi }} $(date +%Y-%m-%d)" \
+            --title "Droidspaces LKM $TAG" \
             --notes-file notes.md \
-            "${FILES[@]}"
+            dist/*.ko dist/*.zip dist/source-*.tar.gz

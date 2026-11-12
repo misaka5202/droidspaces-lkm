@@ -1,6 +1,6 @@
-id=lkm4ctr_oppo
-name=lkm4ctr for OPPO Find X7
-version=4.0.5-oppo
-versionCode=40052
-author=misaka5202 (cyanmint/lkm4ctr + ai-luo2006 extra)
-description=在原厂 GKI 内核上补齐容器能力，让 Droidspaces 可用。含 lkm4ctr(PID/IPC/UTS namespace) + ip6table_nat(IPv6 NAT) + macvlan(容器独立 IP)。实测 Droidspaces check 全部 [MUST HAVE] 通过，Alpine 容器可正常启动。日志: /data/local/tmp/lkm4ctr.log
+id=droidspaces_lkm
+name=Droidspaces LKM
+version=1.0.0
+versionCode=10000
+author=misaka5202
+description=在原始 GKI 内核上补齐 Droidspaces 容器能力: PID/IPC namespace、devtmpfs、macvlan、IPv6 NAT。按 KMI 自动选择模块，无需重编内核。日志: /data/local/tmp/droidspaces-lkm.log
