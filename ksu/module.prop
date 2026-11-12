@@ -1,0 +1,6 @@
+id=lkm4ctr_oppo
+name=lkm4ctr for OPPO Find X7
+version=4.0.5-oppo
+versionCode=40051
+author=misaka5202 (built from cyanmint/lkm4ctr)
+description=在原始 GKI 内核上补齐容器命名空间 (PID/IPC/UTS)，让 Droidspaces 可用。基于 android14-6.1 构建，实测 Droidspaces check 全部 [MUST HAVE] 通过。日志: /data/local/tmp/lkm4ctr.log

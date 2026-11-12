@@ -1,27 +1,26 @@
 name: build lkm4ctr for OPPO Find X7 (android14-6.1)
 
-# 目标: 验证 lkm4ctr 能否在 OPPO MT6989 (Find X7) 上编出可用的 ko。
+# 为 OPPO Find X7 (MT6989) 构建 lkm4ctr.ko, 并打包成 KernelSU 模块。
 #
-# 设备情况:
-#   内核      6.1.157-android14-11-o-g2d576b643492  -> KMI android14-6.1
-#   KPROBES   =y      <- lkm4ctr 的 kprobe 后端依赖它
-#   FTRACE    =y
-#   FUNCTION_TRACER =n <- lkm4ctr 文档说量产 GKI 常关, 会自动走 kprobe 后端
-#   USER_NS   =n      <- 待验证能否被 vendor_kernel 补齐
-#   PID_NS    =n
-#   SYSVIPC   =n
-#   DEVTMPFS  =n
+# 目的: 在**不刷内核**的前提下让 Droidspaces 跑起来。
 #
-# 构建用 SukiSU-Ultra 的 DDK 容器, 里面带该 KMI 真实的
+# 设备情况 (6.1.157-android14-11-o-g2d576b643492, KMI android14-6.1):
+#   缺  CONFIG_PID_NS / SYSVIPC / DEVTMPFS / USER_NS 等
+#   有  CONFIG_KPROBES=y (lkm4ctr 的 kprobe 后端依赖)
+#
+# 实测结果 (2026-11-12, run 43175535973 的产物上机):
+#   Droidspaces v7.2.0 check -> [MUST HAVE] 全部通过
+#   仍未覆盖: DEVTMPFS / MACVLAN / IP6_NF_NAT / CFS_BANDWIDTH /
+#             CGROUP_PIDS / USER_NS (均为 OPTIONAL 或 RECOMMENDED)
+#
+# 构建用 SukiSU-Ultra 的 DDK 容器, 内含该 KMI 真实的
 # vmlinux + Module.symvers + 匹配的 clang 工具链。
-# 比 git clone kernel/common + gki_defconfig + modules_prepare 可靠得多,
-# 后者只有 stub/空的符号 CRC, 会导致 modpost 报未解析核心符号。
 
 on:
   workflow_dispatch:
     inputs:
       kmi:
-        description: 'KMI (默认 android14-6.1)'
+        description: 'KMI'
         required: false
         type: string
         default: 'android14-6.1'
@@ -31,7 +30,7 @@ on:
         type: string
         default: '20260828'
       upstream_ref:
-        description: 'lkm4ctr 源码 ref (分支/tag/commit)'
+        description: 'lkm4ctr 源码 ref'
         required: false
         type: string
         default: 'main'
@@ -51,20 +50,18 @@ jobs:
     timeout-minutes: 60
 
     steps:
+      - name: 检出本仓库
+        uses: actions/checkout@v6
+
       - name: 拉取 lkm4ctr 源码
         run: |
           set -euxo pipefail
           apt-get update -qq || true
           apt-get install -y -qq git ca-certificates || true
+          rm -rf /tmp/lkm4ctr
           git clone --depth=1 --branch "${{ inputs.upstream_ref }}" \
-            https://github.com/cyanmint/lkm4ctr.git "$GITHUB_WORKSPACE/lkm4ctr" || {
-              cd /tmp && rm -rf lkm4ctr
-              git clone --depth=1 https://github.com/cyanmint/lkm4ctr.git lkm4ctr
-              cp -a /tmp/lkm4ctr "$GITHUB_WORKSPACE/lkm4ctr"
-            }
-          cd "$GITHUB_WORKSPACE/lkm4ctr"
-          echo ">>> HEAD: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-          ls vendor/ glue/
+            https://github.com/cyanmint/lkm4ctr.git /tmp/lkm4ctr
+          echo ">>> HEAD: $(git -C /tmp/lkm4ctr rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
       - name: 确认 DDK 环境
         run: |
@@ -72,15 +69,13 @@ jobs:
           KDIR="/opt/ddk/kdir/${{ inputs.kmi }}"
           test -d "$KDIR" || { echo "::error::DDK 目录不存在: $KDIR"; ls /opt/ddk/kdir 2>/dev/null || true; exit 1; }
           echo ">>> KDIR=$KDIR"
-          ls "$KDIR" | head -20
           test -s "$KDIR/Module.symvers" && echo ">>> Module.symvers: $(wc -l < "$KDIR/Module.symvers") 条"
-          test -f "$KDIR/vmlinux" && echo ">>> vmlinux 存在"
 
       - name: 编译 lkm4ctr.ko
         run: |
           set -euxo pipefail
           KDIR="/opt/ddk/kdir/${{ inputs.kmi }}"
-          ROOT="$GITHUB_WORKSPACE/lkm4ctr/vendor"
+          ROOT="/tmp/lkm4ctr/vendor"
           test -f "$ROOT/Makefile" || { echo "::error::vendor/Makefile 不存在"; ls "$ROOT"; exit 1; }
           make -C "$KDIR" M="$ROOT" LKM4CTR_LOG_DMESG=y modules -j"$(nproc)"
           mkdir -p "$GITHUB_WORKSPACE/out"
@@ -91,42 +86,89 @@ jobs:
         run: |
           set -euo pipefail
           KDIR="/opt/ddk/kdir/${{ inputs.kmi }}"
-          FAIL=0
-          DEV_ML=$(awk -F'\t' '$2=="module_layout"{print $1; exit}' "$KDIR/Module.symvers" 2>/dev/null || true)
-          echo "DDK module_layout: ${DEV_ML:-?}"
-          echo "设备 module_layout: 0xea759d7f (来自 device_symvers.txt 的实测值)"
-          echo
-
           for f in "$GITHUB_WORKSPACE"/out/*.ko; do
             [ -f "$f" ] || continue
             echo "=== $(basename "$f") ==="
             VM=$(modinfo -F vermagic "$f" 2>/dev/null || strings "$f" | grep -m1 'vermagic=' | sed 's/vermagic=//')
-            echo "  vermagic: $VM"
-            echo "  大小: $(du -h "$f" | cut -f1)"
-
-            # __versions 段
-            VS=$(llvm-objdump -h "$f" 2>/dev/null | awk '/__versions/{print $3; exit}')
-            if [ -n "$VS" ]; then
-              echo "  __versions: $((16#$VS)) 字节"
-            else
-              echo "  ::warning::无 __versions 段"
+            echo "  vermagic : $VM"
+            echo "  大小     : $(du -h "$f" | cut -f1)"
+            # struct module 尺寸决定 ABI 是否匹配: 设备上所有厂商 ko 都是 1088 (0x440)
+            TM=$(readelf -SW "$f" 2>/dev/null | awk '/this_module/{print $6; exit}')
+            if [ -n "$TM" ]; then
+              echo "  this_module: 0x$TM = $((16#$TM)) 字节"
+              [ "$((16#$TM))" -eq 1088 ] && echo "    OK 与设备 1088 一致" || echo "    ::warning::与设备 1088 不符"
             fi
-
-            # 依赖符号
-            echo "  未定义符号数: $(llvm-nm -u "$f" 2>/dev/null | wc -l)"
+            VS=$(readelf -SW "$f" 2>/dev/null | awk '/__versions/{print $6; exit}')
+            [ -n "$VS" ] && echo "  __versions: $((16#$VS)) 字节"
           done
-          exit $FAIL
 
-      - name: 产物摘要
-        if: always()
+      - name: 打包 KernelSU 模块
         run: |
-          echo "=== 产物 ==="
-          ls -lh "$GITHUB_WORKSPACE/out" 2>/dev/null || echo "(无产物)"
+          set -euo pipefail
+          STAGE="$GITHUB_WORKSPACE/ksu_module"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
 
-      - name: 上传
-        if: always()
+          cp "$GITHUB_WORKSPACE"/out/*.ko "$STAGE/"
+          cp ksu/module.prop    "$STAGE/"
+          cp ksu/service.sh     "$STAGE/"
+          cp ksu/customize.sh   "$STAGE/"
+          cp ksu/uninstall.sh   "$STAGE/"
+          cp ksu/action.sh      "$STAGE/"
+          chmod 755 "$STAGE"/*.sh
+
+          # 脚本必须 LF 换行, 否则 Android 的 sh 会报 "No such file or directory"
+          sed -i 's/\r$//' "$STAGE"/*.sh "$STAGE/module.prop"
+
+          cd "$STAGE"
+          ZIP="$GITHUB_WORKSPACE/lkm4ctr-oppo-$(date +%Y%m%d).zip"
+          rm -f "$ZIP"
+          zip -qr9 "$ZIP" .
+          cd "$GITHUB_WORKSPACE"
+          echo ">>> $ZIP ($(du -h "$ZIP" | cut -f1))"
+          unzip -l "$ZIP"
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+
+      - name: 上传产物
         uses: actions/upload-artifact@v7
         with:
-          name: lkm4ctr-${{ inputs.kmi }}-arm64
-          path: out/
-          if-no-files-found: warn
+          name: lkm4ctr-oppo-${{ inputs.kmi }}
+          path: |
+            out/*.ko
+            lkm4ctr-oppo-*.zip
+          if-no-files-found: error
+
+      - name: 发布 Release
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="build-$(date +%Y%m%d-%H%M%S)"
+          {
+            echo "### lkm4ctr for OPPO Find X7"
+            echo
+            echo "KMI: \`${{ inputs.kmi }}\` / DDK: \`${{ inputs.ddk_release }}\`"
+            echo
+            echo "源码: [cyanmint/lkm4ctr](https://github.com/cyanmint/lkm4ctr)"
+            echo
+            echo "**实测效果**（设备 \`6.1.157-android14-11-o-g2d576b643492\`）:"
+            echo
+            echo "\`\`\`"
+            echo "Droidspaces v7.2.0 check:"
+            echo "  [MUST HAVE] 全部通过"
+            echo "    ✓ PID namespace"
+            echo "    ✓ IPC namespace"
+            echo "    ✓ UTS / Mount namespace"
+            echo "\`\`\`"
+            echo
+            echo "**未覆盖**（Droidspaces 标为 OPTIONAL/RECOMMENDED）:"
+            echo "\`DEVTMPFS\` \`MACVLAN\` \`IP6_NF_NAT\` \`CFS_BANDWIDTH\` \`CGROUP_PIDS\` \`USER_NS\`"
+            echo
+            echo "**安装**: 刷入 zip → 重启。日志 \`/data/local/tmp/lkm4ctr.log\`"
+          } > notes.md
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "lkm4ctr ${{ inputs.kmi }} $(date +%Y-%m-%d)" \
+            --notes-file notes.md \
+            out/*.ko lkm4ctr-oppo-*.zip
