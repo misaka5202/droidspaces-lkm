@@ -38,4 +38,17 @@ static inline unsigned long __nocfi droid_lkm_misc_sym(const char *name)
 	return kallrecon_klp(name);
 }
 
+/*
+ * droid_lkm_misc_report - 原项目用它把子功能状态上报到 procfs 供 App 读取。
+ * 独立模块没有 procfs 上报面, 做成空实现即可:
+ * 真正让 Droidspaces 认可硬件访问的是 /proc/filesystems 里出现 "devtmpfs",
+ * 而那由 register_filesystem() 完成, 与这个上报无关。
+ */
+static inline void droid_lkm_misc_report(const char *feature, const char *state,
+					 const char *detail)
+{
+	pr_info("[" DROID_LKM_MISC_TAG "] %s: %s%s%s\n", feature, state,
+		detail ? " - " : "", detail ? detail : "");
+}
+
 #endif /* DROID_LKM_MISC_H */
