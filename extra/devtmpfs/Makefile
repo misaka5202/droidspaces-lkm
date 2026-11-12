@@ -14,7 +14,7 @@
 
 obj-m := devtmpfs_lkm.o
 devtmpfs_lkm-y := main.o devtmpfs.o \
-	hk/hk_inline.o hk/hk_patch.o hk/hk_flush.o \
+	hk/hk.o hk/hk_inline.o hk/hk_patch.o hk/hk_flush.o \
 	kr/core.o kr/access.o kr/discover.o kr/symbol.o kr/slide.o \
 	kr/fastboot.o kr/hint.o kr/variant.o kr/anchor.o
 
