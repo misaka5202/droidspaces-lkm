@@ -38,7 +38,7 @@ Droidspaces 需要 PID/IPC namespace、devtmpfs、macvlan、IPv6 NAT 等内核�
 [✓] All required features found!
 ```
 
-实测环境：OPPO Find X7（MT6989 / KMI `android14-6.1`），
+实测环境：（MT6989 / KMI `android14-6.1`），
 容器可正常启动 Alpine / Debian，`pid=1`、`uid=0`、`apk` 可用、硬件节点已映射。
 
 ---
@@ -105,7 +105,7 @@ droidspaces check                           # 应显示 All required features fo
 | `android13-5.10` | 5.10 | 自动 |
 | `android13-5.15` | 5.15 | 自动 |
 | `android14-5.15` | 5.15 | 自动 |
-| `android14-6.1` | 6.1 | 自动（已实机验证）|
+| `android14-6.1` | 6.1 | 自动 |
 | `android15-6.6` | 6.6 | 自动 |
 | `android16-6.12` | 6.12 | 自动 |
 
