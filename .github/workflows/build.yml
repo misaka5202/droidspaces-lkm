@@ -98,7 +98,7 @@ jobs:
           # 这些模块来自 ai-luo2006/droidspaces-6.12-pmb110, 原本针对
           # android16-6.12。在 6.1 上大概率编不过, 但 continue-on-error
           # 让失败不影响主模块产物, 同时暴露真实错误用于后续适配。
-          for m in net_macvlan net_ip6nat; do
+          for m in net_macvlan_61 net_macvlan net_ip6nat; do
             SRC="$GITHUB_WORKSPACE/extra/$m"
             [ -f "$SRC/Makefile" ] || { echo "::warning::$m 无 Makefile, 跳过"; continue; }
             echo "=============================================="
