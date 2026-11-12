@@ -1,1 +1,0 @@
-cmd_/mnt/c/lkm4ctr-oppo/extra/devtmpfs/devtmpfs_lkm.o := ld.lld -EL  -maarch64elf -z norelro -z noexecstack   -r -o /mnt/c/lkm4ctr-oppo/extra/devtmpfs/devtmpfs_lkm.o @/mnt/c/lkm4ctr-oppo/extra/devtmpfs/devtmpfs_lkm.mod 

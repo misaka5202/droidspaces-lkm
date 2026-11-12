@@ -1,0 +1,13 @@
+# kbuild 中间产物
+*.o
+*.ko
+*.mod
+*.mod.c
+*.symvers
+*.order
+.*.cmd
+.tmp_versions/
+Module.symvers
+
+# 保留 prebuilt（WSL 验证过的产物）
+!prebuilt/*.ko
