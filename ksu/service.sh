@@ -1,21 +1,21 @@
 #!/system/bin/sh
-# lkm4ctr 开机加载 - 适配 OPPO Find X7 (android14-6.1)
-#
-# 单 KMI 简化版: ko 就在模块目录里, 不需要 KMI 选择逻辑。
+# lkm4ctr + 额外模块 开机加载 - 适配 OPPO Find X7 (android14-6.1)
 #
 # 设备实测结论 (2026-11-12):
-#   模块加载后 Droidspaces 官方 check 显示 [MUST HAVE] 全部通过:
-#     PID namespace   ✓   <- 由本模块补齐 (原 CONFIG_PID_NS=n)
-#     IPC namespace   ✓   <- 由本模块补齐 (原 CONFIG_IPC_NS 实际为 y)
-#     UTS / Mount namespace ✓
+#   lkm4ctr 加载后 Droidspaces 官方 check 显示 [MUST HAVE] 全部通过:
+#     PID namespace / IPC namespace / UTS namespace / Mount namespace
+#   容器实测可启动: Alpine 3.20 内 pid=1 uid=0, apk 可用。
 #
-# 仍未覆盖 (Droidspaces 标为 OPTIONAL/RECOMMENDED, 不影响启动):
+# 未覆盖项 (Droidspaces 标为 OPTIONAL/RECOMMENDED, 不影响启动):
 #   CONFIG_DEVTMPFS      -> 硬件访问模式不可用, 自动回退 tmpfs
 #   CONFIG_MACVLAN       -> --net=macvlan 不可用
 #   CONFIG_IP6_NF_NAT    -> NAT 容器仅 IPv4
 #   CONFIG_CFS_BANDWIDTH -> --cpus 被跳过
 #   CONFIG_CGROUP_PIDS   -> --pids-limit 被跳过
 #   CONFIG_USER_NS       -> --allow-sandboxing 不可用
+#
+# 额外模块 (macvlan.ko / ip6table_nat.ko) 来自 ai-luo2006/droidspaces-6.12-pmb110,
+# 若能编译成功则一并加载, 失败不影响主模块。
 
 MODDIR=${0%/*}
 [ "$MODDIR" = "$0" ] && MODDIR=.
@@ -25,46 +25,53 @@ LOG="/data/local/tmp/lkm4ctr.log"
 echo "=== lkm4ctr load $(date) ===" >> "$LOG"
 echo "kernel: $(uname -r)" >> "$LOG"
 
-KO="$MODDIR/lkm4ctr.ko"
-if [ ! -f "$KO" ]; then
-    echo "[FAIL] ko 不存在: $KO" >> "$LOG"
-    exit 1
-fi
+loaded_any=0
 
-# 已加载则跳过, 避免重复 insmod
-if grep -q '^lkm4ctr ' /proc/modules 2>/dev/null; then
-    echo "[SKIP] 已加载" >> "$LOG"
-    exit 0
-fi
+# 逐个加载目录内所有 ko。
+# lkm4ctr 放第一个: 它提供 namespace, 其他模块可能依赖。
+for ko in "$MODDIR"/lkm4ctr.ko "$MODDIR"/macvlan.ko "$MODDIR"/ip6table_nat.ko; do
+    [ -f "$ko" ] || continue
+    name=$(basename "$ko" .ko)
 
-# 先尝试正常加载
-if out=$(insmod "$KO" 2>&1); then
-    echo "[OK] insmod 成功" >> "$LOG"
-else
-    echo "[WARN] insmod 失败: $out" >> "$LOG"
-    # 以下按需放开。本机实测无需任何参数即加载成功,
-    # 说明 DDK 编出的模块 ABI 与设备一致 (struct module 1088 字节匹配)。
-    # if out2=$(insmod "$KO" gate=0 2>&1); then
-    #     echo "[OK] 带 gate=0 加载成功" >> "$LOG"
-    # else
-    #     echo "[FAIL] $out2" >> "$LOG"
-    #     exit 1
-    # fi
-fi
+    # 已加载则跳过
+    if grep -q "^${name} " /proc/modules 2>/dev/null; then
+        echo "[SKIP] $name 已加载" >> "$LOG"
+        continue
+    fi
 
-# 记录加载结果
+    if out=$(insmod "$ko" 2>&1); then
+        echo "[OK]   $name" >> "$LOG"
+        loaded_any=1
+    else
+        echo "[FAIL] $name: $out" >> "$LOG"
+    fi
+done
+
+# 兼容: 目录里还可能有其他命名
+for ko in "$MODDIR"/*.ko; do
+    [ -f "$ko" ] || continue
+    name=$(basename "$ko" .ko)
+    case "$name" in
+        lkm4ctr|macvlan|ip6table_nat) continue ;;
+    esac
+    grep -q "^${name} " /proc/modules 2>/dev/null && continue
+    if out=$(insmod "$ko" 2>&1); then
+        echo "[OK]   $name" >> "$LOG"
+    else
+        echo "[FAIL] $name: $out" >> "$LOG"
+    fi
+done
+
 echo "--- lsmod ---" >> "$LOG"
-lsmod | grep -E '^lkm4ctr' >> "$LOG" 2>/dev/null
+lsmod | grep -E '^(lkm4ctr|macvlan|ip6table_nat)' >> "$LOG" 2>/dev/null
 
-# 验证 namespace 能力是否生效
+# 验证 namespace 能力
 echo "--- namespace 验证 ---" >> "$LOG"
-if unshare -pf true 2>/dev/null; then
-    echo "[OK] PID namespace 可用" >> "$LOG"
-else
-    echo "[FAIL] PID namespace 不可用" >> "$LOG"
-fi
-if unshare -i true 2>/dev/null; then
-    echo "[OK] IPC namespace 可用" >> "$LOG"
-else
-    echo "[FAIL] IPC namespace 不可用" >> "$LOG"
-fi
+unshare -pf true 2>/dev/null \
+    && echo "[OK] PID namespace 可用" >> "$LOG" \
+    || echo "[FAIL] PID namespace 不可用" >> "$LOG"
+unshare -i true 2>/dev/null \
+    && echo "[OK] IPC namespace 可用" >> "$LOG" \
+    || echo "[FAIL] IPC namespace 不可用" >> "$LOG"
+
+exit 0
