@@ -1,4 +1,4 @@
-# OPPO Find X7 实测状态
+# 实测状态
 
 > 内核 `6.1.157-android14-11-o-g2d576b643492` / KMI `android14-6.1`
 > KCFI 严格模式 (`CONFIG_CFI_CLANG=y`, `CFI_PERMISSIVE` 未开)
