@@ -1,6 +1,6 @@
 # anland Linux 桌面部署手册
 
-在 **OPPO Find X7 (MT6989 / Mali-G720)** 上运行 Linux 桌面，
+在 ** (MT6989 / Mali-G720)** 上运行 Linux 桌面，
 画面通过 anland 显示在 Android 屏幕上。
 
 本文档记录的是**实际验证过的步骤**，每一条都有对应的实测证据。
