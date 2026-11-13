@@ -1,0 +1,614 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * droid_lkm_cpu — cpu.max 模拟（6.1 自研版）
+ *
+ * 目标：让 Droidspaces 的 --cpus（CPU 配额）在 CONFIG_CFS_BANDWIDTH=n 的
+ * 内核上真正生效。
+ *
+ * CFS_BANDWIDTH=n 的后果：
+ *   - cpu_cfs_quota_us / cpu.max 的写路径不存在（cpu_max_write 整个在
+ *     #ifdef 里被删掉）
+ *   - throttle_cfs_rq / tg_set_cfs_bandwidth 执行体不存在
+ *
+ * 本模块用「时间片限流」替代 CFS 的平滑 throttle：
+ *   1. cpu.max 文件挂在 memory 子系统上（v2 根只有 memory 可用，
+ *      与 droid_lkm_pids 同理）
+ *   2. write 解析 "<quota_us> <period_us>"，存进 per-cgroup xarray
+ *   3. delayed_work 每 100ms 采样该 cgroup 的 cpu.stat usage_usec
+ *   4. 窗口内用量超 quota → 把 cgroup 进程冻结（v1 freezer FROZEN）
+ *   5. 窗口结束 → used 重置、解冻
+ *
+ * 冻结是"硬限流"而非"软限流"：被冻结的窗口进程完全不运行，之后恢复。
+ * 这比 CFS 的 throttle 更暴力，但效果是真实的上限，不欺骗。
+ *
+ * 记账来源：/sys/fs/cgroup/<路径>/cpu.stat 的 usage_usec。
+ * 该文件在这台设备上存在（vendor 内核的 cpu 子系统提供），
+ * 用 filp_open + kernel_read 读取（每 100ms 一次，开销可忽略）。
+ *
+ * 加载方式：insmod，不设开机自启。所有探针 best-effort。
+ */
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/kprobes.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/xarray.h>
+#include <linux/cgroup.h>
+#include <linux/cgroup-defs.h>
+#include <linux/kernfs.h>
+#include <linux/sched.h>
+#include <linux/sched/task.h>
+#include <linux/atomic.h>
+#include <linux/seq_file.h>
+#include <linux/version.h>
+#include <linux/workqueue.h>
+#include <linux/jiffies.h>
+#include <linux/fs.h>
+#include <linux/file.h>
+#include <linux/vmalloc.h>
+
+#include "kr/core.h"
+
+#define TAG "droid_lkm_cpu"
+#define cpu_info(fmt, ...)  pr_info("[" TAG "] " fmt, ##__VA_ARGS__)
+#define cpu_warn(fmt, ...)  pr_warn("[" TAG "] " fmt, ##__VA_ARGS__)
+#define cpu_err(fmt, ...)   pr_err("[" TAG "] " fmt, ##__VA_ARGS__)
+
+/* 采样周期：10ms。必须远小于默认 period(100ms)，否则"设基准"和
+ * "窗口重置"两个分支就会占满每次 tick，永远走不到配额检查。 */
+#define CPU_TICK_MS 10
+
+/* per-cgroup 状态 */
+struct cpu_priv {
+	atomic64_t quota_us;	/* 0=未启用; S64_MAX="max" 无限 */
+	atomic64_t period_us;
+	atomic64_t used_us;	/* 本窗口累计 */
+	atomic64_t window_start;/* ktime_to_us */
+	atomic64_t window_usage_base; /* 窗口起点累计 usage（us） */
+	atomic64_t frozen;	/* 0/1：当前是否被冻结 */
+};
+
+static DEFINE_XARRAY(cpu_xa);
+
+static struct cpu_priv *cpu_find(struct cgroup *cgrp)
+{
+	return xa_load(&cpu_xa, (unsigned long)cgrp);
+}
+
+/* ---------------------------------------------------------- cpu.max --- */
+
+static u64 cpu_max_read_u64(struct cgroup_subsys_state *css,
+			    struct cftype *cft)
+{
+	struct cgroup *cgrp = css->cgroup;
+	struct cpu_priv *p = cpu_find(cgrp);
+
+	return p ? (u64)atomic64_read(&p->quota_us) : 0;
+}
+
+static ssize_t cpu_max_write(struct kernfs_open_file *of, char *buf,
+			     size_t nbytes, loff_t off)
+{
+	struct cgroup *cgrp = of->kn->parent->priv;
+	char tmp[64];
+	size_t i = 0, j = 0;
+	s64 quota, period = 100000;
+	struct cpu_priv *p;
+	char *end;
+
+	/* copy the (not null terminated) write buffer */
+	while (i < nbytes && j < sizeof(tmp) - 1 && buf[i] != '\n')
+		tmp[j++] = buf[i++];
+	tmp[j] = '\0';
+	while (j > 0 && (tmp[j - 1] == ' ' || tmp[j - 1] == '\t'))
+		tmp[--j] = '\0';
+
+	if (strcmp(tmp, "max") == 0) {
+		quota = S64_MAX;
+	} else {
+		long q = simple_strtol(tmp, &end, 10);
+
+		if (end == tmp)
+			return -EINVAL;
+		quota = (s64)q;
+		/* 可选 " <period>" */
+		while (*end == ' ' || *end == '\t')
+			end++;
+		if (*end != '\0') {
+			long pr = simple_strtol(end, &end, 10);
+
+			if (*end != '\0')
+				return -EINVAL;
+			if (pr > 0)
+				period = (s64)pr;
+		}
+		if (quota < 0)
+			quota = 0;
+	}
+
+	p = cpu_find(cgrp);
+	if (!p) {
+		p = kzalloc(sizeof(*p), GFP_KERNEL);
+		if (!p)
+			return -ENOMEM;
+		atomic64_set(&p->quota_us, 0);
+		atomic64_set(&p->period_us, 100000);
+		atomic64_set(&p->used_us, 0);
+		atomic64_set(&p->window_start, 0);
+		atomic64_set(&p->window_usage_base, 0);
+		atomic64_set(&p->frozen, 0);
+		{
+			struct cpu_priv *old =
+				xa_store(&cpu_xa, (unsigned long)cgrp, p,
+					 GFP_KERNEL);
+			if (xa_is_err(old)) {
+				kfree(p);
+				return xa_err(old);
+			}
+			if (old) {
+				kfree(p);
+				p = old;
+			}
+		}
+	}
+	atomic64_set(&p->quota_us, quota);
+	atomic64_set(&p->period_us, period > 0 ? period : 100000);
+	atomic64_set(&p->used_us, 0);
+	atomic64_set(&p->window_start, ktime_to_us(ktime_get()));
+	atomic64_set(&p->window_usage_base, 0);
+	atomic64_set(&p->frozen, 0);
+	cpu_info("cpu.max=%lld/%lld on cgroup %px\n",
+		 (long long)quota, (long long)period, cgrp);
+	return (ssize_t)nbytes;
+}
+
+static int cpu_max_show(struct seq_file *sf, void *v)
+{
+	struct cgroup_subsys_state *css = seq_css(sf);
+	struct cpu_priv *p = cpu_find(css->cgroup);
+	u64 quota = p ? atomic64_read(&p->quota_us) : 0;
+	u64 period = p ? atomic64_read(&p->period_us) : 100000;
+
+	if (quota == S64_MAX)
+		seq_puts(sf, "max\n");
+	else
+		seq_printf(sf, "%llu %llu\n", quota, period);
+	return 0;
+}
+
+static struct cftype cpu_max_files[] = {
+	{
+		.name = "cpu.max",
+		.flags = CFTYPE_NO_PREFIX | CFTYPE_NOT_ON_ROOT,
+		.read_u64 = cpu_max_read_u64,
+		.write = cpu_max_write,
+	},
+	{
+		.name = "cpu.limit.stats",
+		.flags = CFTYPE_NO_PREFIX | CFTYPE_NOT_ON_ROOT,
+		.seq_show = cpu_max_show,
+	},
+	{},
+};
+
+/* ---------------------------------------------------------- 冻结动作 ---
+ *
+ * 用 SIGSTOP/SIGCONT 而不是 v1 freezer：
+ *   - 不需要把进程迁到别的 cgroup 层级（v1 freezer 是独立层级）
+ *   - SIGSTOP 的进程进入 T 态，cpu.stat 的 usage 不再增长，正是限流效果
+ *   - SIGCONT 恢复，进程继续
+ * 通过 kallsyms 解析 css_task_iter / send_sig_info（均未导出）。
+ */
+
+static void (*p_css_task_iter_start)(struct cgroup_subsys_state *css,
+				     unsigned int flags,
+				     struct css_task_iter *it);
+static struct task_struct *(*p_css_task_iter_next)(struct css_task_iter *it);
+static void (*p_css_task_iter_end)(struct css_task_iter *it);
+static int (*p_send_sig_info)(int sig, struct kernel_siginfo *info,
+			      struct task_struct *p);
+
+static void (*p_rstat_flush_hold)(struct cgroup *cgrp);
+static unsigned long long (*p_task_sched_runtime)(struct task_struct *p);
+static void (*p_rstat_flush_release)(void);
+static unsigned long ctl_bstat_off;
+
+static bool ctl_read_ptr(unsigned long addr, unsigned long *out)
+{
+	return copy_from_kernel_nofault(out, (void *)addr, sizeof(*out)) == 0;
+}
+
+static void cpu_resolve_syms(void)
+{
+	p_css_task_iter_start =
+		(void *)kallrecon_klp("css_task_iter_start");
+	p_css_task_iter_next =
+		(void *)kallrecon_klp("css_task_iter_next");
+	p_css_task_iter_end =
+		(void *)kallrecon_klp("css_task_iter_end");
+	p_send_sig_info =
+		(void *)kallrecon_klp("send_sig_info");
+	p_rstat_flush_hold =
+		(void *)kallrecon_klp("cgroup_rstat_flush_hold");
+	p_rstat_flush_release =
+		(void *)kallrecon_klp("cgroup_rstat_flush_release");
+	p_task_sched_runtime =
+		(void *)kallrecon_klp("task_sched_runtime");
+}
+
+/*
+ * struct cgroup.bstat 的偏移：编译期 offsetof 以模块自己的头文件为准，
+ * 运行内核如果 CONFIG_SCHED_CORE / CGROUP_SUBSYS_COUNT 不同，偏移就错。
+ * 用 init_css_set 布局校验（同 droid_lkm_pids 的做法）：
+ *   css_set 以 subsys[CGROUP_SUBSYS_COUNT] 开头，数 cgroup_subsys[] 的
+ *   实际长度，修正 dfl_cgrp 偏移并校验 init_css_set.dfl_cgrp。
+ * bstat 在 cgroup 的尾部区域，前面的 e_csets[CGROUP_SUBSYS_COUNT] 和
+ * rstat 字段都受 SUBSYS_COUNT 影响，所以同样修正。
+ */
+static void __nocfi cpu_layout_init(void)
+{
+	unsigned long subsys, init_css, dfl_root, init_task_addr;
+	unsigned long expect_root, v;
+	int phone_count = 0, i;
+
+	subsys = kallrecon_klp("cgroup_subsys");
+	init_css = kallrecon_klp("init_css_set");
+	dfl_root = kallrecon_klp("cgrp_dfl_root");
+	init_task_addr = kallrecon_klp("init_task");
+
+	if (!subsys || !init_css || !dfl_root || !init_task_addr) {
+		cpu_warn("layout symbols missing\n");
+		return;
+	}
+
+	for (i = 0; i < 64; i++) {
+		if (!ctl_read_ptr(subsys + i * 8, &v))
+			break;
+		if (!v || (v & 0xffff000000000000UL) != 0xffff000000000000UL)
+			break;
+		phone_count++;
+	}
+
+	/* 校验 css_set.dfl_cgrp，用修正后的偏移 */
+	{
+		unsigned long dfl_off = offsetof(struct css_set, dfl_cgrp) +
+			(long)(phone_count - (int)CGROUP_SUBSYS_COUNT) * 8;
+
+		expect_root = dfl_root + offsetof(struct cgroup_root, cgrp);
+		if (!ctl_read_ptr(init_css + dfl_off, &v) || v != expect_root) {
+			cpu_warn("css_set.dfl_cgrp unverified (cnt=%d)\n",
+				 phone_count);
+			return;
+		}
+	}
+
+	/*
+	 * bstat 修正：cgroup 的 e_csets[CGROUP_SUBSYS_COUNT] 在 bstat 之前，
+	 * SUBSYS_COUNT 差多少就修正多少 * 8（指针数组）。
+	 */
+	ctl_bstat_off = offsetof(struct cgroup, bstat) +
+		(long)(phone_count - (int)CGROUP_SUBSYS_COUNT) * 8;
+	cpu_info("layout ok: controllers=%d bstat_off=%lu\n",
+		 phone_count, ctl_bstat_off);
+	cpu_info("syms: flush_hold=%px flush_release=%px\n",
+		 p_rstat_flush_hold, p_rstat_flush_release);
+}
+
+static void __nocfi cpu_sig_cgroup(struct cgroup *cgrp, int sig)
+{
+	struct cgroup_subsys_state *css = NULL;
+	struct css_task_iter it;
+	struct task_struct *tsk;
+	struct kernel_siginfo info;
+
+	if (!p_css_task_iter_start || !p_css_task_iter_next ||
+	    !p_css_task_iter_end || !p_send_sig_info)
+		return;
+
+	/* 用 cgroup 自己的 css（root css）遍历 */
+	css = &cgrp->self;
+	memset(&it, 0, sizeof(it));
+	p_css_task_iter_start(css, 0, &it);
+	while ((tsk = p_css_task_iter_next(&it))) {
+		memset(&info, 0, sizeof(info));
+		info.si_signo = sig;
+		info.si_code = SI_KERNEL;
+		p_send_sig_info(sig, &info, tsk);
+	}
+	p_css_task_iter_end(&it);
+}
+
+/*
+ * 读 cgroup 的 cpu.stat usage_usec。
+ * 路径：/sys/fs/cgroup/<kn 路径>/cpu.stat
+ * 用 kernfs 路径构造：of->kn 的完整路径由 kernfs_path 提供。
+ */
+static bool cpu_debug;
+
+module_param_named(debug, cpu_debug, bool, 0444);
+MODULE_PARM_DESC(debug, "log sampling state once per second");
+
+/*
+ * 读 cgroup 的累计 CPU 时间（ns -> us）。
+ * 不走 vfs（SELinux EACCES + hrtimer 上下文 panic 两重教训），
+ * 直接读内核内部聚合字段：
+ *   cgroup_rstat_flush_hold(cgrp) 刷出聚合值
+ *   cgrp->bstat.cputime.sum_exec_runtime 读
+ *   cgroup_rstat_flush_release(cgrp)
+ */
+static u64 __nocfi cpu_read_usage(struct cgroup *cgrp)
+{
+	struct cgroup_subsys_state *css;
+	struct css_task_iter it;
+	struct task_struct *tsk;
+	unsigned long long total = 0;
+	int n = 0;
+
+	if (!p_css_task_iter_start || !p_css_task_iter_next ||
+	    !p_css_task_iter_end || !p_task_sched_runtime)
+		return 0;
+
+	/* 进程实际活在 ds-enter 等子 cgroup，css_task_iter 只遍历本
+	 * cgroup 的 css_set，所以沿 children 递归累加整棵子树 */
+	{
+		struct cgroup *kids[64];
+		int nkids = 0, ki = 0;
+		struct cgroup_subsys_state *csss[64];
+		struct cgroup *cur = cgrp;
+
+		csss[0] = &cur->self;
+		kids[0] = cur;
+		nkids = 1;
+
+		while (ki < nkids && ki < 64) {
+			struct cgroup *c = kids[ki++];
+			struct cgroup_subsys_state *csc = &c->self;
+
+			p_css_task_iter_start(csc, CSS_TASK_ITER_PROCS, &it);
+			while ((tsk = p_css_task_iter_next(&it))) {
+				unsigned long long rt = p_task_sched_runtime(tsk);
+
+				total += rt;
+				n++;
+				if (cpu_debug && n <= 2) {
+					static unsigned long last_rt;
+					if (time_after(jiffies, last_rt + 3 * HZ)) {
+						last_rt = jiffies;
+						pr_info("[droid_lkm_cpu] task %s pid=%d rt=%llu\n",
+							tsk->comm, tsk->pid, rt);
+					}
+				}
+				if (n > 4096)
+					break;
+			}
+			p_css_task_iter_end(&it);
+
+			/* 收集子 cgroup（BFS，防深度过大） */
+			{
+				struct cgroup *child;
+				struct cgroup_subsys_state *cc;
+
+				rcu_read_lock();
+				list_for_each_entry(cc, &c->self.children,
+						    sibling) {
+					if (nkids >= 64)
+						break;
+					child = cc->cgroup;
+					kids[nkids++] = child;
+				}
+				rcu_read_unlock();
+			}
+			if (n > 4096)
+				break;
+		}
+		(void)csss;
+		if (cpu_debug) {
+			static unsigned long last_nk;
+			if (time_after(jiffies, last_nk + 3 * HZ)) {
+				last_nk = jiffies;
+				pr_info("[droid_lkm_cpu] cgrp=%px subtree: kids=%d tasks=%d total=%llu\n",
+					cgrp, nkids, n, total);
+			}
+		}
+	}
+
+	if (cpu_debug && n == 0) {
+		static unsigned long last_empty;
+		if (time_after(jiffies, last_empty + 3 * HZ)) {
+			last_empty = jiffies;
+			pr_info("[droid_lkm_cpu] cgrp=%px has no tasks\n",
+				cgrp);
+		}
+	}
+	return (u64)(total / 1000);
+}
+
+/* ---------------------------------------------------------- 采样循环 ---
+ *
+ * 注意：采样不能跑在 hrtimer 中断上下文里。filp_open/kernel_read 走完整
+ * vfs 路径（path_openat → 锁、睡眠、用户地址访问），在中断上下文调用会
+ * do_mem_abort 导致 kernel panic（本机已实测：cpu_tick+0x238 filp_open
+ * → die_kernel_fault）。用 delayed_work 让采样在进程上下文执行。
+ */
+
+static struct delayed_work cpu_tick_work;
+static bool cpu_tick_running;
+
+static void __nocfi cpu_tick(struct work_struct *w)
+{
+	struct cpu_priv *p;
+	unsigned long idx;
+	u64 now = ktime_to_us(ktime_get());
+
+	if (cpu_debug) {
+		static unsigned long last_count;
+		int cnt = 0;
+
+		xa_for_each(&cpu_xa, idx, p) {
+			cnt++;
+			if (time_after(jiffies, last_count + 5 * HZ)) {
+				pr_info("[droid_lkm_cpu] entry[%d] cgrp=%px quota=%lld\n",
+					cnt, (void *)idx,
+					(long long)atomic64_read(&p->quota_us));
+			}
+		}
+		if (time_after(jiffies, last_count + 5 * HZ)) {
+			last_count = jiffies;
+			pr_info("[droid_lkm_cpu] xarray entries=%d\n", cnt);
+		}
+	}
+
+	xa_for_each(&cpu_xa, idx, p) {
+		u64 quota = atomic64_read(&p->quota_us);
+		u64 period = atomic64_read(&p->period_us);
+		u64 used;
+		u64 wstart;
+		struct cgroup *cgrp = (struct cgroup *)idx;
+
+		if (quota <= 0 || quota == S64_MAX)
+			continue;
+
+		{
+			u64 total = cpu_read_usage(cgrp);
+			u64 wbase = atomic64_read(&p->window_usage_base);
+			u64 wused;
+
+			if (cpu_debug && !total) {
+				static unsigned long last_zero;
+				if (time_after(jiffies, last_zero + 3 * HZ)) {
+					last_zero = jiffies;
+					pr_info("[droid_lkm_cpu] cgrp=%px total=0 (read fail?)\n",
+						cgrp);
+				}
+			}
+
+			if (!wbase) {
+				/* 第一次采样：以当前累计值为基准 */
+				atomic64_set(&p->window_usage_base, total);
+				atomic64_set(&p->window_start, now);
+				continue;
+			}
+
+			wstart = atomic64_read(&p->window_start);
+			if (wstart && now - wstart >= period) {
+				/* 窗口结束：重置基准并解冻 */
+				atomic64_set(&p->window_usage_base, total);
+				atomic64_set(&p->window_start, now);
+				atomic64_set(&p->used_us, 0);
+				if (atomic64_read(&p->frozen)) {
+					atomic64_set(&p->frozen, 0);
+					cpu_info("cgroup %px window reset, "
+						 "SIGCONT\n", cgrp);
+					cpu_sig_cgroup(cgrp, SIGCONT);
+				}
+				continue;
+			}
+
+			wused = total >= wbase ? total - wbase : 0;
+			atomic64_set(&p->used_us, wused);
+			used = wused;
+
+			if (cpu_debug) {
+				/* 每个 cgroup 独立节流打印 */
+				static unsigned long last_dbg[8];
+				static unsigned long dbg_cg[8];
+				unsigned long cgv = (unsigned long)cgrp;
+				int slot = -1, k;
+
+				for (k = 0; k < 8; k++) {
+					if (dbg_cg[k] == cgv) {
+						slot = k;
+						break;
+					}
+					if (dbg_cg[k] == 0 && slot < 0)
+						slot = k;
+				}
+				if (slot >= 0) {
+					dbg_cg[slot] = cgv;
+					if (time_after(jiffies, last_dbg[slot] + HZ)) {
+						last_dbg[slot] = jiffies;
+						pr_info("[droid_lkm_cpu] dbg cgrp=%px window_used=%llu quota=%llu frozen=%lld\n",
+							cgrp, (unsigned long long)wused,
+							(unsigned long long)quota,
+							(long long)atomic64_read(&p->frozen));
+					}
+				}
+			}
+			if (wused >= quota && !atomic64_read(&p->frozen)) {
+				atomic64_set(&p->frozen, 1);
+				cpu_warn("cgroup %px over quota (%llu >= %llu), "
+					 "SIGSTOP\n", cgrp, wused, quota);
+				cpu_sig_cgroup(cgrp, SIGSTOP);
+			}
+		}
+	}
+
+	schedule_delayed_work(&cpu_tick_work,
+			      msecs_to_jiffies(CPU_TICK_MS));
+}
+
+/* ---------------------------------------------------------- init/exit -- */
+
+static struct cgroup_subsys *memory_ss;
+static bool cpu_files_live;
+
+static int __init droid_lkm_cpu_init(void)
+{
+	unsigned long mem_ss_addr;
+	int ret;
+
+	find_kallsyms_base();
+	if (!klnum_val || !kallrecon_klp) {
+		cpu_err("kallsyms recovery failed\n");
+		return -ENODATA;
+	}
+
+	mem_ss_addr = kallrecon_klp("memory_cgrp_subsys");
+	if (!mem_ss_addr) {
+		cpu_err("memory_cgrp_subsys not found\n");
+		return -ENODEV;
+	}
+	memory_ss = (struct cgroup_subsys *)mem_ss_addr;
+
+	cpu_resolve_syms();
+	cpu_layout_init();
+
+	ret = cgroup_add_dfl_cftypes(memory_ss, cpu_max_files);
+	if (ret)
+		cpu_err("cgroup_add_dfl_cftypes failed: %d\n", ret);
+	else
+		cpu_files_live = true;
+
+	INIT_DELAYED_WORK(&cpu_tick_work, cpu_tick);
+	schedule_delayed_work(&cpu_tick_work, msecs_to_jiffies(CPU_TICK_MS));
+	cpu_tick_running = true;
+
+	cpu_info("cpu.max emulation active (files=%d)\n", cpu_files_live);
+	return 0;
+}
+
+static void __exit droid_lkm_cpu_exit(void)
+{
+	struct cpu_priv *p;
+	unsigned long idx;
+
+	if (cpu_tick_running) {
+		cancel_delayed_work_sync(&cpu_tick_work);
+		cpu_tick_running = false;
+	}
+	if (cpu_files_live)
+		cgroup_rm_cftypes(cpu_max_files);
+
+	xa_for_each(&cpu_xa, idx, p)
+		kfree(p);
+	xa_destroy(&cpu_xa);
+	cpu_info("unloaded\n");
+}
+
+module_init(droid_lkm_cpu_init);
+module_exit(droid_lkm_cpu_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("emulated cpu.max for a kernel built without CONFIG_CFS_BANDWIDTH");
+MODULE_AUTHOR("misaka5202");
