@@ -100,47 +100,15 @@ jobs:
             done
           fi
 
-      - name: 编译四个模块
+      - name: 编译模块
         env:
           KMI: ${{ matrix.kmi }}
         run: |
-          set -euxo pipefail
+          set -uo pipefail
           KDIR="/opt/ddk/kdir/$KMI"
           test -d "$KDIR" || { echo "::error::DDK 目录不存在: $KDIR"; ls /opt/ddk/kdir; exit 1; }
-
-          OUT="$GITHUB_WORKSPACE/out"
-          mkdir -p "$OUT"
-
-          # 1) lkm4ctr
-          make -C "$KDIR" M=/tmp/lkm4ctr/vendor LKM4CTR_LOG_DMESG=y modules -j"$(nproc)"
-          cp /tmp/lkm4ctr/vendor/lkm4ctr.ko "$OUT/lkm4ctr-$KMI.ko"
-
-          # 2-4) 额外模块。任何一个失败只跳过, 不中断整条矩阵 ——
-          #      这是为了让能编的 KMI 尽量产出可用包。
-          for m in net_macvlan_61 net_ip6nat devtmpfs vkms; do
-            SRC="$GITHUB_WORKSPACE/extra/$m"
-            [ -f "$SRC/Makefile" ] || { echo "::warning::$m 无 Makefile"; continue; }
-            echo "=============================================="
-            echo ">>> $m @ $KMI"
-            echo "=============================================="
-            if make -C "$KDIR" M="$SRC" modules -j"$(nproc)"; then
-              case "$m" in
-                net_macvlan_61) cp "$SRC"/macvlan.ko "$OUT/macvlan-$KMI.ko" ;;
-                net_ip6nat)     cp "$SRC"/ip6table_nat.ko "$OUT/ip6table_nat-$KMI.ko" ;;
-                devtmpfs)       cp "$SRC"/devtmpfs_lkm.ko "$OUT/devtmpfs_lkm-$KMI.ko" ;;
-                vkms)           cp "$SRC"/vkms.ko "$OUT/vkms-$KMI.ko" ;;
-              esac
-              echo "    [OK] $m"
-            else
-              echo "    [FAIL] $m @ $KMI (跳过)"
-            fi
-            # 清掉中间产物, 避免污染下一个模块
-            find "$SRC" -name '*.o' -delete 2>/dev/null || true
-            find "$SRC" -name '.*.cmd' -delete 2>/dev/null || true
-          done
-
-          echo "=== 产物 ==="
-          ls -lh "$OUT"
+          chmod +x "$GITHUB_WORKSPACE/scripts/build_modules.sh"
+          bash "$GITHUB_WORKSPACE/scripts/build_modules.sh"                "$KMI" "$KDIR" "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/out"
 
       - name: 校验
         env:
@@ -261,7 +229,7 @@ jobs:
           # 按 KMI 拆分单包
           for f in dist/*.ko; do
             [ -f "$f" ] || continue
-            kmi=$(basename "$f" | sed -E 's/^(lkm4ctr|devtmpfs_lkm|macvlan|ip6table_nat)-(.*)\.ko$/\2/')
+            kmi=$(basename "$f" | sed -E 's/^(lkm4ctr|devtmpfs_lkm|macvlan|ip6table_nat|vkms)-(.*)\.ko$/\2/')
             case "$kmi" in
               android*) ;;
               *) continue ;;
