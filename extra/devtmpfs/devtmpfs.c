@@ -58,7 +58,14 @@
 #include <linux/mount.h>
 #include <uapi/linux/mount.h>
 #include <linux/stat.h>
+/*
+ * linux/mnt_idmapping.h 是 6.3 才引入的; 5.10 / 5.15 上没有这个头文件。
+ * compat_61.h 已经为老内核把 &nop_mnt_idmap 映射成 &init_user_ns, 所以这里
+ * 直接跳过 include 即可, 不需要那个头里的任何声明。
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 #include <linux/mnt_idmapping.h>
+#endif
 
 #include "misc.h"
 #include "misc_ksym.h"

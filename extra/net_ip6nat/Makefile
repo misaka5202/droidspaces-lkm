@@ -8,5 +8,5 @@ CFLAGS_ip6table_nat_core.o := -include $(src)/ip6t_nat_shim.h
 
 # KallRecon: 恢复内核 kallsyms 表，模块自解析地址
 ccflags-y += -Wno-declaration-after-statement -Wno-unused-variable \
-	-Wno-unused-function -Wno-strict-prototypes
+	-Wno-unused-function -Wno-strict-prototypes -Wno-gcc-compat
 ccflags-y += -I$(src)/kr
