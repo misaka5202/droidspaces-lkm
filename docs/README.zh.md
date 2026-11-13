@@ -25,22 +25,37 @@ cgroup 控制器。多数厂商内核为了通过 GKI ABI 检查把这些都编�
   [✗] IPv6 NAT support
 ```
 
-装上本项目后：
+装上本项目后，每一行都是勾：
 
 ```
 [MUST HAVE]
-  [✓] PID namespace       ← lkm4ctr
-  [✓] IPC namespace       ← lkm4ctr
+  [✓] Root privileges          [✓] PID namespace
+  [✓] Linux version            [✓] Mount namespace
+  [✓] UTS namespace            [✓] IPC namespace
+  [✓] pivot_root syscall       [✓] /proc filesystem
+  [✓] /sys filesystem          [✓] Seccomp support
+
 [RECOMMENDED]
-  [✓] devtmpfs support    ← devtmpfs_lkm
+  [✓] epoll / signalfd / PTY / devpts      [✓] Loop device
+  [✓] ext4 filesystem                      [✓] Cgroup v2 support
+  [✓] Cgroup namespace                     [✓] New mount API
+  [✓] devtmpfs support
+
 [OPTIONAL]
-  [✓] Macvlan support     ← macvlan
-  [✓] IPv6 NAT support    ← ip6table_nat
-  [✓] CPU limit support   ← droid_lkm_cpu
-  [✓] Process limit       ← droid_lkm_pids
+  [✓] FUSE support             [✓] TUN/TAP support
+  [✓] OverlayFS support        [✓] Network namespace
+  [✓] Bridge device support    [✓] Veth pair support
+  [✓] Macvlan support          [✓] IPv6 NAT support
+  [✓] Memory limit support     [✓] Swap limit support
+  [✓] CPU limit support        [✓] CPU usage accounting
+  [✓] Process limit support    [✓] Sandboxing (user namespaces)
 
 [✓] All required features found!
 ```
+
+这是 6.1.157 厂商内核上的真实输出，不是推测。`OPTIONAL` 那一块才是重点：
+`CPU limit`、`Process limit`、`Sandboxing` 正是"模块补不了"的三项，也是
+本项目以 v1.0.0 而不是 v0.x 发布的原因。
 
 ## 包含的模块
 
@@ -51,10 +66,12 @@ cgroup 控制器。多数厂商内核为了通过 GKI ABI 检查把这些都编�
 | `macvlan.ko` | 容器独立局域网 IP | `MACVLAN` | ✅ |
 | `ip6table_nat.ko` | IPv6 NAT | `IP6_NF_NAT` / `IP6_NF_TARGET_MASQUERADE` | ✅ |
 | `vkms.ko` | 虚拟 DRM 设备，提供 render node | `DRM_VKMS`（含 `DRIVER_RENDER` 补丁） | ✅ |
-| `droid_lkm_pids.ko` | 仿真 pids 控制器 | `CGROUP_PIDS` | 手动 |
-| `droid_lkm_cpu.ko` | 时间片 CPU 配额 | `CFS_BANDWIDTH` | 手动 |
+| `droid_lkm_pids.ko` | 仿真 pids 控制器 | `CGROUP_PIDS` | ✅ |
+| `droid_lkm_cpu.ko` | 时间片 CPU 配额 | `CFS_BANDWIDTH` | ✅ |
 
-最后两个**只支持手动 `insmod`**，见 [cgroup 限制](#cgroup-限制)。
+**七个模块全部开机加载。** 两个仿真模块排最后，不会挡住上面五个：它们
+失败时设备照常开机、照常跑容器，只是少了对应的限额。想"装但不加载"某个，
+在模块目录放 `disable_pids` / `disable_cpu` 文件即可。
 
 ## 安装
 
@@ -72,8 +89,12 @@ insmod lkm4ctr-<kmi>.ko
 insmod devtmpfs_lkm-<kmi>.ko devtmpfs_probe=2
 insmod ip6table_nat-<kmi>.ko
 insmod macvlan-<kmi>.ko
-insmod vkms-<kmi>.ko                       # 只在需要 render node 时
+insmod vkms-<kmi>.ko
+insmod droid_lkm_pids-<kmi>.ko
+insmod droid_lkm_cpu-<kmi>.ko
 ```
+
+`vkms` 只在需要给 Wayland 合成器提供 render node 时才有意义，其他模块不依赖它。
 
 **`devtmpfs_probe=2` 很重要。** 它只注册文件系统，不启动 kthread、不装设备
 hook。Droidspaces 只看 `/proc/filesystems` 里有没有 `devtmpfs`；默认路径

@@ -28,22 +28,38 @@ GKI ABI checks. This project packages them as loadable modules (`.ko`) that you
   [✗] IPv6 NAT support
 ```
 
-After loading these modules:
+After loading these modules, every line is a tick:
 
 ```
 [MUST HAVE]
-  [✓] PID namespace       ← lkm4ctr
-  [✓] IPC namespace       ← lkm4ctr
+  [✓] Root privileges          [✓] PID namespace
+  [✓] Linux version            [✓] Mount namespace
+  [✓] UTS namespace            [✓] IPC namespace
+  [✓] pivot_root syscall       [✓] /proc filesystem
+  [✓] /sys filesystem          [✓] Seccomp support
+
 [RECOMMENDED]
-  [✓] devtmpfs support    ← devtmpfs_lkm
+  [✓] epoll / signalfd / PTY / devpts      [✓] Loop device
+  [✓] ext4 filesystem                      [✓] Cgroup v2 support
+  [✓] Cgroup namespace                     [✓] New mount API
+  [✓] devtmpfs support
+
 [OPTIONAL]
-  [✓] Macvlan support     ← macvlan
-  [✓] IPv6 NAT support    ← ip6table_nat
-  [✓] CPU limit support   ← droid_lkm_cpu
-  [✓] Process limit       ← droid_lkm_pids
+  [✓] FUSE support             [✓] TUN/TAP support
+  [✓] OverlayFS support        [✓] Network namespace
+  [✓] Bridge device support    [✓] Veth pair support
+  [✓] Macvlan support          [✓] IPv6 NAT support
+  [✓] Memory limit support     [✓] Swap limit support
+  [✓] CPU limit support        [✓] CPU usage accounting
+  [✓] Process limit support    [✓] Sandboxing (user namespaces)
 
 [✓] All required features found!
 ```
+
+That is the real output from a 6.1.157 vendor kernel, not a projection. The
+`OPTIONAL` block is the interesting one: `CPU limit`, `Process limit` and
+`Sandboxing` are the three a module was supposed to be unable to provide, and
+they are the reason this project exists at v1.0.0 rather than v0.x.
 
 ## Modules
 
@@ -54,10 +70,13 @@ After loading these modules:
 | `macvlan.ko` | Per-container LAN IP | `MACVLAN` | ✅ |
 | `ip6table_nat.ko` | IPv6 NAT | `IP6_NF_NAT` / `IP6_NF_TARGET_MASQUERADE` | ✅ |
 | `vkms.ko` | Virtual DRM device, provides a render node | `DRM_VKMS` (with `DRIVER_RENDER` patch) | ✅ |
-| `droid_lkm_pids.ko` | Emulated pids controller | `CGROUP_PIDS` | manual |
-| `droid_lkm_cpu.ko` | Time-slice CPU quota | `CFS_BANDWIDTH` | manual |
+| `droid_lkm_pids.ko` | Emulated pids controller | `CGROUP_PIDS` | ✅ |
+| `droid_lkm_cpu.ko` | Time-slice CPU quota | `CFS_BANDWIDTH` | ✅ |
 
-The last two are **manual `insmod` only** — see [cgroup limits](#cgroup-limits).
+**All seven load at boot.** The two emulation modules go last and cannot block
+the five above them: a failure there leaves a device that still boots and runs
+containers, just without the corresponding limit. To install but not load one,
+drop a `disable_pids` / `disable_cpu` file in the module directory.
 
 ## Install
 
@@ -75,8 +94,13 @@ insmod lkm4ctr-<kmi>.ko
 insmod devtmpfs_lkm-<kmi>.ko devtmpfs_probe=2
 insmod ip6table_nat-<kmi>.ko
 insmod macvlan-<kmi>.ko
-insmod vkms-<kmi>.ko                       # only if you need a render node
+insmod vkms-<kmi>.ko
+insmod droid_lkm_pids-<kmi>.ko
+insmod droid_lkm_cpu-<kmi>.ko
 ```
+
+`vkms` is only worth loading if you want a render node for a Wayland
+compositor; nothing else depends on it.
 
 **`devtmpfs_probe=2` matters.** It registers the filesystem and starts no
 kthread or device hooks. Droidspaces only looks for `devtmpfs` in

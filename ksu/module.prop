@@ -3,4 +3,4 @@ name=Droidspaces LKM
 version=1.0.0
 versionCode=10000
 author=misaka5202
-description=在原始 GKI 内核上补齐 Droidspaces 容器能力
+description=在原始 GKI 内核上补齐 Droidspaces 全部容器能力：命名空间、devtmpfs、macvlan、IPv6 NAT、render node、CPU/进程数限额、user namespace 沙箱。七个模块开机自动加载，无需重编内核或刷 boot。
