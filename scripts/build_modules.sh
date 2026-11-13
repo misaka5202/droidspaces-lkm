@@ -85,6 +85,7 @@ fi
 # 合成器(gbm_create_device + drmOpenRender)要的正是 render node。
 # ---------------------------------------------------------------------------
 log "=== vkms @ $KMI ==="
+SKIP_VKMS=0
 DST=/tmp/mod-vkms
 rm -rf "$DST"; mkdir -p "$DST"
 if [ -n "$KSRC" ] && [ -d "$KSRC/drivers/gpu/drm/vkms" ]; then
@@ -92,48 +93,32 @@ if [ -n "$KSRC" ] && [ -d "$KSRC/drivers/gpu/drm/vkms" ]; then
     # Makefile 由我们生成, 内核树里那份是 obj-$(CONFIG_DRM_VKMS) 形式
     rm -f "$DST/Makefile" "$DST/Kconfig"
 
+    # DRIVER_RENDER 补丁交给独立脚本。内联 heredoc 里的正则很容易
+    # 被 shell 转义吃掉: 之前 [^,换行] 那个字符类被写成真实换行,
+    # 正则失效, 补丁静默没打上, 产物里的 vkms 只建 card 没有 render node。
     if ! grep -q 'DRIVER_RENDER' "$DST/vkms_drv.c" 2>/dev/null; then
-        # 在 driver_features 的最后一个标志后追加 " | DRIVER_RENDER"。
-        # 不能动那个逗号: .driver_features = A | B | C,  追加要插在 C 之后、
-        # 逗号之前, 否则会得到 "... | C, | DRIVER_RENDER," 这种东西。
-        python3 - "$DST/vkms_drv.c" <<'PYEOF' || true
-import re, sys
-p = sys.argv[1]
-try:
-    s = open(p, encoding='utf-8').read()
-except OSError:
-    sys.exit(1)
-if 'DRIVER_RENDER' in s:
-    sys.exit(0)
-
-m = re.search(r'\.driver_features\s*=\s*([^,
-]+)', s)
-if m:
-    body = m.group(1).rstrip()
-    s = s[:m.start(1)] + body + ' | DRIVER_RENDER' + s[m.end(1):]
-else:
-    # 没有 driver_features 字段就把整个结构体加上
-    s = s.replace('DRIVER_MODESET | DRIVER_ATOMIC | DRIVER_GEM',
-                  'DRIVER_MODESET | DRIVER_ATOMIC | DRIVER_GEM | DRIVER_RENDER')
-try:
-    open(p, 'w', encoding='utf-8').write(s)
-except OSError:
-    sys.exit(1)
-PYEOF
-        # python3 可能不存在(容器极简), 用 sed 兜底
-        if ! grep -q 'DRIVER_RENDER' "$DST/vkms_drv.c" 2>/dev/null; then
-            sed -i -E 's/(\.driver_features[^=]*=[^
-]*[^,[:space:]])([[:space:]]*,)/ | DRIVER_RENDER/' "$DST/vkms_drv.c"
+        if ! python3 "$WS/scripts/patch_vkms_driver_features.py" "$DST/vkms_drv.c"; then
+            warn "vkms @ $KMI (DRIVER_RENDER 补丁失败)"
         fi
+    fi
+    # 二次确认: 没打上就不出货 —— 没有 DRIVER_RENDER 的 vkms 只能建 card,
+    # 拿不到 render node, 对 Wayland 合成器完全没用
+    if ! grep -q 'DRIVER_RENDER' "$DST/vkms_drv.c" 2>/dev/null; then
+        warn "vkms @ $KMI (driver_features 里没有 DRIVER_RENDER, 跳过出货)"
+        SKIP_VKMS=1
     fi
 
     log "  driver_features: $(grep -h 'driver_features' "$DST/vkms_drv.c" 2>/dev/null | head -1 | tr -s ' ')"
 
-    gen_makefile "$DST" vkms "-DCONFIG_DRM_VKMS=1"
-    if make -C "$KDIR" M="$DST" modules -j"$NPROC"; then
-        cp "$DST/vkms.ko" "$OUT/vkms-$KMI.ko" && log "  [OK]"
+    if [ "${SKIP_VKMS:-0}" = "1" ]; then
+        warn "vkms @ $KMI (补丁未生效, 不编译)"
     else
-        warn "vkms @ $KMI"
+        gen_makefile "$DST" vkms "-DCONFIG_DRM_VKMS=1"
+        if make -C "$KDIR" M="$DST" modules -j"$NPROC"; then
+            cp "$DST/vkms.ko" "$OUT/vkms-$KMI.ko" && log "  [OK]"
+        else
+            warn "vkms @ $KMI"
+        fi
     fi
 else
     warn "vkms @ $KMI (内核树无源码)"
