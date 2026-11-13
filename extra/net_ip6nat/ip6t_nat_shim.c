@@ -111,31 +111,94 @@ void *__nocfi droid_nat_ip6t_alloc_initial_table(const struct xt_table *t)
 	return fn(t);
 }
 
+/*
+ * ip6t_register_table 的形状在两个区间不同:
+ *
+ *   <=5.10: int ip6t_register_table(net, table, repl, ops,
+ *                                   struct xt_table **res)
+ *   5.15+ : int ip6t_register_table(net, table, repl, ops)
+ *
+ * core.c 用 #if 分别调用正确的形状, 所以这里的定义也只保留当前内核需要
+ * 的那一个 —— 上面的 #define 已把内核头的声明改成这个名字, 定义必须和它
+ * 完全一致, 否则宏展开处直接类型不符。
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
 int __nocfi droid_nat_ip6t_register_table(struct net *net,
 					  const struct xt_table *table,
 					  const struct ip6t_replace *repl,
 					  const struct nf_hook_ops *ops)
 {
-	typeof(&ip6t_register_table) fn = (void *)a_register_table;
+	int (*fn)(struct net *, const struct xt_table *,
+		  const struct ip6t_replace *, const struct nf_hook_ops *);
 
-	if (unlikely(!fn)) {
+	if (unlikely(!a_register_table)) {
 		nat_warn_once("ip6t_register_table");
 		return -ENOSYS;
 	}
+	fn = (int (*)(struct net *, const struct xt_table *,
+		      const struct ip6t_replace *,
+		      const struct nf_hook_ops *))a_register_table;
 	return fn(net, table, repl, ops);
 }
+#else
+int __nocfi droid_nat_ip6t_register_table(struct net *net,
+					  const struct xt_table *table,
+					  const struct ip6t_replace *repl,
+					  const struct nf_hook_ops *ops,
+					  struct xt_table **res)
+{
+	int (*fn)(struct net *, const struct xt_table *,
+		  const struct ip6t_replace *, const struct nf_hook_ops *,
+		  struct xt_table **);
 
+	if (unlikely(!a_register_table)) {
+		nat_warn_once("ip6t_register_table");
+		return -ENOSYS;
+	}
+	fn = (int (*)(struct net *, const struct xt_table *,
+		      const struct ip6t_replace *, const struct nf_hook_ops *,
+		      struct xt_table **))a_register_table;
+	return fn(net, table, repl, ops, res);
+}
+#endif
+
+/*
+ * ip6t_unregister_table_exit 的参数也变了:
+ *   <=5.10: (struct net *, struct xt_table *)
+ *   5.15+ : (struct net *, const char *)
+ * 老内核上 core.c 传的是 name, 这里查成 table 再调。
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
 void __nocfi droid_nat_ip6t_unregister_table_exit(struct net *net,
 						  const char *name)
 {
-	typeof(&ip6t_unregister_table_exit) fn = (void *)a_unregister_table_exit;
+	void (*fn)(struct net *, const char *);
 
-	if (unlikely(!fn)) {
+	if (unlikely(!a_unregister_table_exit)) {
 		nat_warn_once("ip6t_unregister_table_exit");
 		return;
 	}
+	fn = (void (*)(struct net *, const char *))a_unregister_table_exit;
 	fn(net, name);
 }
+#else
+void __nocfi droid_nat_ip6t_unregister_table_exit(struct net *net,
+						  const char *name)
+{
+	void (*fn)(struct net *, struct xt_table *);
+	struct xt_table *table = net->ipv6.ip6table_nat;
+
+	if (unlikely(!a_unregister_table_exit)) {
+		nat_warn_once("ip6t_unregister_table_exit");
+		return;
+	}
+	fn = (void (*)(struct net *, struct xt_table *))a_unregister_table_exit;
+	if (table) {
+		fn(net, table);
+		net->ipv6.ip6table_nat = NULL;
+	}
+}
+#endif
 
 /*
  * ip6t_do_table 的签名随内核版本变化。上面 #define 已把内核头里的声明改名到
@@ -198,6 +261,12 @@ unsigned int __nocfi droid_nat_ip6t_do_table_legacy(void *priv,
 }
 #endif
 
+/*
+ * xt_find_table 同样是 5.15 才有的对外符号 (5.10 只有 xt_find_table_lock,
+ * 且未导出)。5.10 上 core.c 直接从 net->ipv6.ip6table_nat 取表, 不用这个
+ * shim —— 连带 unregister 的 5.10 分支也改成读那个字段。
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
 struct xt_table *__nocfi droid_nat_xt_find_table(struct net *net, u8 af,
 						 const char *name)
 {
@@ -209,29 +278,41 @@ struct xt_table *__nocfi droid_nat_xt_find_table(struct net *net, u8 af,
 	}
 	return fn(net, af, name);
 }
+#endif
 
+/*
+ * 5.10 完全没有 xt_register_template 这一对 API (内核在 5.15 才引入
+ * template 机制), 它的头文件里也就没有声明 —— 于是 typeof(&xt_...)
+ * 在这里无法成立。core.c 对应位置用 #if 走了 init_net 直建表的老路径,
+ * 所以这段只在 5.15+ 参与编译。
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
 int __nocfi droid_nat_xt_register_template(const struct xt_table *t,
 					   int (*table_init)(struct net *net))
 {
-	typeof(&xt_register_template) fn = (void *)a_register_template;
+	int (*fn)(const struct xt_table *, int (*)(struct net *));
 
-	if (unlikely(!fn)) {
+	if (unlikely(!a_register_template)) {
 		nat_warn_once("xt_register_template");
 		return -ENOSYS;
 	}
+	fn = (int (*)(const struct xt_table *,
+		      int (*)(struct net *)))a_register_template;
 	return fn(t, table_init);
 }
 
 void __nocfi droid_nat_xt_unregister_template(const struct xt_table *t)
 {
-	typeof(&xt_unregister_template) fn = (void *)a_unregister_template;
+	void (*fn)(const struct xt_table *);
 
-	if (unlikely(!fn)) {
+	if (unlikely(!a_unregister_template)) {
 		nat_warn_once("xt_unregister_template");
 		return;
 	}
+	fn = (void (*)(const struct xt_table *))a_unregister_template;
 	fn(t);
 }
+#endif
 
 int __nocfi droid_nat_nf_nat_ipv6_register_fn(struct net *net,
 					      const struct nf_hook_ops *ops)

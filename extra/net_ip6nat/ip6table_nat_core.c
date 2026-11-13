@@ -108,7 +108,13 @@ static int ip6t_nat_register_lookups(struct net *net)
 	struct xt_table *table;
 	int i, ret;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
 	table = xt_find_table(net, NFPROTO_IPV6, "nat");
+#else
+	/* 5.10 没有 xt_find_table 这个对外符号; 内核自己把注册出来的表存
+	 * 在 net->ipv6.ip6table_nat 里, 直接取即可。 */
+	table = net->ipv6.ip6table_nat;
+#endif
 	if (WARN_ON_ONCE(!table))
 		return -ENOENT;
 
@@ -156,8 +162,18 @@ static int ip6table_nat_table_init(struct net *net)
 	repl = ip6t_alloc_initial_table(&nf_nat_ipv6_table);
 	if (repl == NULL)
 		return -ENOMEM;
-	ret = ip6t_register_table(net, &nf_nat_ipv6_table, repl,
-				  NULL);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
+	ret = ip6t_register_table(net, &nf_nat_ipv6_table, repl, NULL);
+#else
+	/* 5.10 的 ip6t_register_table 多一个输出参数, 注册出来的表要存回
+	 * net->ipv6.ip6table_nat —— 后面的 lookups 和 exit 都靠它找回表。 */
+	if (net->ipv6.ip6table_nat) {
+		kfree(repl);
+		return 0;
+	}
+	ret = ip6t_register_table(net, &nf_nat_ipv6_table, repl, NULL,
+				  &net->ipv6.ip6table_nat);
+#endif
 	if (ret < 0) {
 		kfree(repl);
 		return ret;
@@ -205,17 +221,28 @@ static int __init ip6table_nat_init(void)
 	if (ret < 0)
 		return ret;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
+	/* 5.15+ 用 template 机制: 注册一个"表模板", 每个 netns 创建时由
+	 * ip6table_nat_table_init 生成实际的 xt_table。 */
 	ret = xt_register_template(&nf_nat_ipv6_table,
 				   ip6table_nat_table_init);
 	if (ret)
 		unregister_pernet_subsys(&ip6table_nat_net_ops);
+#else
+	/* 5.10 没有 xt_register_template, 只在 init_net 上建一次表。 */
+	ret = ip6table_nat_table_init(&init_net);
+	if (ret)
+		unregister_pernet_subsys(&ip6table_nat_net_ops);
+#endif
 
 	return ret;
 }
 
 static void __exit ip6table_nat_exit(void)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
 	xt_unregister_template(&nf_nat_ipv6_table);
+#endif
 	unregister_pernet_subsys(&ip6table_nat_net_ops);
 }
 
