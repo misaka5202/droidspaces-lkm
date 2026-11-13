@@ -51,6 +51,18 @@ Droidspaces 需要 PID/IPC namespace、devtmpfs、macvlan、IPv6 NAT 等内核�
 | `devtmpfs_lkm.ko` | 注册 devtmpfs 文件系统 | `DEVTMPFS` |
 | `macvlan.ko` | 容器独立局域网 IP | `MACVLAN` |
 | `ip6table_nat.ko` | IPv6 NAT | `IP6_NF_NAT` / `IP6_NF_TARGET_MASQUERADE` |
+| `vkms.ko` | 虚拟 DRM 设备，提供 render node | `DRM_VKMS`（含 `DRIVER_RENDER` 补丁） |
+
+### 额外能力：让 Wayland 合成器跑起来
+
+`vkms` 模块提供 `/dev/dri/renderD128`，这是 Hyprland / KWin 的
+Wayland 后端的硬性前提。厂商内核普遍只开了 `card0`（显示控制器），
+没有 render node。
+
+实测在这台 Mali 设备上，配合 anland 可以把 Linux 桌面显示到
+Android 屏幕——终端、窗口、键盘输入都工作。
+
+完整部署步骤（含踩过的坑）见 **[docs/ANLAND-DEPLOY.md](docs/ANLAND-DEPLOY.md)**。
 
 ### 仍未覆盖
 
