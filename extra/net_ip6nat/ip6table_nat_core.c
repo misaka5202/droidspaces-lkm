@@ -15,6 +15,14 @@
 
 #include <net/netfilter/nf_nat.h>
 
+/*
+ * 老内核(5.10/5.15)的头文件里没有 xt_find_table 的对外声明, 调用它会被判为
+ * 隐式声明并因 -Werror 中断。这里补一条: 此时内核头已 include 完毕, u8 等
+ * 类型都已可用。__nocfi 必须和 shim.c 里的定义保持一致, 否则类型不符。
+ */
+extern struct xt_table *__nocfi droid_nat_xt_find_table(struct net *net, u8 af,
+                                                        const char *name);
+
 struct ip6table_nat_pernet {
 	struct nf_hook_ops *nf_nat_ops;
 };
