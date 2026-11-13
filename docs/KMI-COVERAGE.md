@@ -106,7 +106,7 @@ done
 
 ## 真机验证记录
 
-`android14-6.1`（OPPO Find X7，MT6989）实测通过：
+`android14-6.1`（MTK SoC，GKI 6.1）实测通过：
 
 ```
 $ insmod vkms-android14-6.1.ko

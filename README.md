@@ -1,16 +1,21 @@
 # Droidspaces LKM
 
-**在原始 GKI 内核上补齐容器能力，无需重编内核、无需刷 boot。**
+**Container capabilities for stock GKI kernels — no kernel rebuild, no boot image flashing.**
 
-Droidspaces 需要 PID/IPC namespace、devtmpfs、macvlan、IPv6 NAT 等内核特性，
-而多数厂商内核为了通过 GKI ABI 检查把这些都关掉了。本项目把这些能力做成
-可加载模块（`.ko`），`insmod` 即可使用。
+[![Build](https://github.com/misaka5202/droidspaces-lkm/actions/workflows/build.yml/badge.svg)](https://github.com/misaka5202/droidspaces-lkm/actions/workflows/build.yml)
+
+[中文说明](docs/README.zh.md) · [Releases](../../releases/latest) · [KMI coverage](docs/KMI-COVERAGE.md)
 
 ---
 
-## 为什么需要它
+Droidspaces needs PID/IPC namespaces, devtmpfs, macvlan, IPv6 NAT and a few
+cgroup controllers. Most vendor kernels ship with those compiled out to satisfy
+GKI ABI checks. This project packages them as loadable modules (`.ko`) that you
+`insmod` on a locked-bootloader device.
 
-`droidspaces check` 在未打补丁的厂商内核上是这样的：
+## What it fixes
+
+`droidspaces check` on an unpatched vendor kernel:
 
 ```
 [MUST HAVE]
@@ -23,175 +28,207 @@ Droidspaces 需要 PID/IPC namespace、devtmpfs、macvlan、IPv6 NAT 等内核�
   [✗] IPv6 NAT support
 ```
 
-装上本项目后：
+After loading these modules:
 
 ```
 [MUST HAVE]
-  [✓] PID namespace       ← lkm4ctr 补齐
-  [✓] IPC namespace       ← lkm4ctr 补齐
+  [✓] PID namespace       ← lkm4ctr
+  [✓] IPC namespace       ← lkm4ctr
 [RECOMMENDED]
   [✓] devtmpfs support    ← devtmpfs_lkm
 [OPTIONAL]
   [✓] Macvlan support     ← macvlan
   [✓] IPv6 NAT support    ← ip6table_nat
+  [✓] CPU limit support   ← droid_lkm_cpu
+  [✓] Process limit       ← droid_lkm_pids
 
 [✓] All required features found!
 ```
 
-实测环境：（MT6989 / KMI `android14-6.1`），
-容器可正常启动 Alpine / Debian，`pid=1`、`uid=0`、`apk` 可用、硬件节点已映射。
+## Modules
 
----
+| Module | Purpose | CONFIG it stands in for | Autoload |
+|--------|---------|------------------------|:---:|
+| `lkm4ctr.ko` | Namespace core | `PID_NS` / `UTS_NS` / `IPC_NS` / `SYSVIPC` / `POSIX_MQUEUE` | ✅ |
+| `devtmpfs_lkm.ko` | Registers a devtmpfs filesystem | `DEVTMPFS` | ✅ |
+| `macvlan.ko` | Per-container LAN IP | `MACVLAN` | ✅ |
+| `ip6table_nat.ko` | IPv6 NAT | `IP6_NF_NAT` / `IP6_NF_TARGET_MASQUERADE` | ✅ |
+| `vkms.ko` | Virtual DRM device, provides a render node | `DRM_VKMS` (with `DRIVER_RENDER` patch) | ✅ |
+| `droid_lkm_pids.ko` | Emulated pids controller | `CGROUP_PIDS` | manual |
+| `droid_lkm_cpu.ko` | Time-slice CPU quota | `CFS_BANDWIDTH` | manual |
 
-## 包含的模块
+The last two are **manual `insmod` only** — see [cgroup limits](#cgroup-limits).
 
-| 模块 | 作用 | 补齐的 CONFIG |
-|------|------|---------------|
-| `lkm4ctr.ko` | 命名空间核心 | `PID_NS` / `UTS_NS` / `IPC_NS` / `SYSVIPC` / `POSIX_MQUEUE` |
-| `devtmpfs_lkm.ko` | 注册 devtmpfs 文件系统 | `DEVTMPFS` |
-| `macvlan.ko` | 容器独立局域网 IP | `MACVLAN` |
-| `ip6table_nat.ko` | IPv6 NAT | `IP6_NF_NAT` / `IP6_NF_TARGET_MASQUERADE` |
-| `vkms.ko` | 虚拟 DRM 设备，提供 render node | `DRM_VKMS`（含 `DRIVER_RENDER` 补丁） |
+## Install
 
-### 额外能力：让 Wayland 合成器跑起来
+### Option A — KernelSU / APatch module (recommended)
 
-`vkms` 模块提供 `/dev/dri/renderD128`，这是 Hyprland / KWin 的
-Wayland 后端的硬性前提。厂商内核普遍只开了 `card0`（显示控制器），
-没有 render node。
+Download `droidspaces-lkm-<kmi>-arm64.zip` from
+[Releases](../../releases/latest), flash it in the manager, reboot.
 
-实测在这台 Mali 设备上，配合 anland 可以把 Linux 桌面显示到
-Android 屏幕——终端、窗口、键盘输入都工作。
+The module picks the `.ko` matching `/proc/sys/kernel/osrelease` at boot.
 
-完整部署步骤（含踩过的坑）见 **[docs/ANLAND-DEPLOY.md](docs/ANLAND-DEPLOY.md)**。
-
-### 仍未覆盖
-
-| 项 | 原因 |
-|---|---|
-| `CFS_BANDWIDTH`（`--cpus`） | 改变调度器结构体大小，上千个导出符号 CRC 变化，厂商模块会拒绝加载 |
-| `CGROUP_PIDS`（`--pids-limit`） | 同上，改变 cgroup 结构体 |
-| `USER_NS`（`--allow-sandboxing`） | 需要内核 `map_write` 等一系列 userns 核心路径，`CONFIG_USER_NS=n` 时这些代码不存在 |
-
-这三项都是 OPTIONAL 分区，不影响容器启动。
-
----
-
-## 安装
-
-### 方式一：KernelSU 模块（推荐）
-
-从 [Releases](../../releases/latest) 下载 `droidspaces-lkm-<kmi>-arm64.zip`，
-在 KernelSU / APatch 管理器里刷入，重启。
-
-模块会按 `/proc/sys/kernel/osrelease` 自动选择匹配当前 KMI 的 `.ko`。
-
-### 方式二：手动 insmod
+### Option B — manual insmod
 
 ```sh
-# 下载对应 KMI 的 ko
 insmod lkm4ctr-<kmi>.ko
 insmod devtmpfs_lkm-<kmi>.ko devtmpfs_probe=2
 insmod ip6table_nat-<kmi>.ko
 insmod macvlan-<kmi>.ko
+insmod vkms-<kmi>.ko                       # only if you need a render node
 ```
 
-**`devtmpfs_probe=2` 参数很重要**：它表示只注册文件系统、不启动 kthread 和
-设备 hook。Droidspaces 只需要 `/proc/filesystems` 里出现 `devtmpfs`，
-默认路径（`probe=0`）会安装 inline hook，在版本不匹配的内核上风险更高。
+**`devtmpfs_probe=2` matters.** It registers the filesystem and starts no
+kthread or device hooks. Droidspaces only looks for `devtmpfs` in
+`/proc/filesystems`; the default path (`probe=0`) installs inline hooks, which
+is riskier on a kernel it was not built against.
 
-### 验证
+### Verify
 
 ```sh
-cat /proc/filesystems | grep devtmpfs      # 应有 devtmpfs
-unshare -pf true && echo "PID ns OK"       # 应无输出表示成功
-droidspaces check                           # 应显示 All required features found
+cat /proc/filesystems | grep devtmpfs      # devtmpfs should appear
+unshare -pf true && echo "PID ns OK"
+droidspaces check                          # "All required features found!"
 ```
 
----
+## Supported KMI
 
-## 支持的 KMI
+| KMI | Kernel | Build |
+|-----|--------|:---:|
+| `android12-5.10` | 5.10 | auto |
+| `android13-5.10` | 5.10 | auto |
+| `android13-5.15` | 5.15 | auto |
+| `android14-5.15` | 5.15 | auto |
+| `android14-6.1` | 6.1 | auto |
+| `android15-6.6` | 6.6 | auto |
+| `android16-6.12` | 6.12 | auto |
 
-| KMI | 内核 | 构建 |
-|-----|------|:---:|
-| `android12-5.10` | 5.10 | 自动 |
-| `android13-5.10` | 5.10 | 自动 |
-| `android13-5.15` | 5.15 | 自动 |
-| `android14-5.15` | 5.15 | 自动 |
-| `android14-6.1` | 6.1 | 自动 |
-| `android15-6.6` | 6.6 | 自动 |
-| `android16-6.12` | 6.12 | 自动 |
+**arm64 only.** Non-GKI kernels and non-ARM64 devices are not supported.
 
-**仅 arm64。** 非 GKI 内核、非 ARM64 设备不受支持。
+Every module is built for every KMI from that KMI's own kernel source tree in
+the DDK image; see [docs/KMI-COVERAGE.md](docs/KMI-COVERAGE.md) for the exact
+matrix and the per-KMI build traps.
 
-> 厂商定制内核即使 KMI 相同，ABI 也可能有差异。装之前先确认
-> `uname -r` 里的 KMI 标签，装完看 `/data/local/tmp/droidspaces-lkm.log`。
+> A vendor kernel with the same KMI tag can still differ in ABI. Check the KMI
+> tag in `uname -r` first, and read `/data/local/tmp/droidspaces-lkm.log` after
+> installing.
 
----
+## cgroup limits
 
-## 重要提醒
+`--cpus` and `--pids-limit` are the two knobs that cannot be fixed by toggling a
+config: with `CONFIG_CFS_BANDWIDTH=n` and `CONFIG_CGROUP_PIDS=n` the code paths
+are deleted at compile time, so there is nothing to enable. These two modules
+emulate the semantics instead:
 
-### `vermagic` 不匹配也可能加载成功
+```sh
+insmod droid_lkm_pids-<kmi>.ko
+insmod droid_lkm_cpu-<kmi>.ko
+```
 
-实测：DDK 编出的 ko `vermagic` 是 `6.1.166-dirty`，设备是
-`6.1.157-android14-11`，`insmod` 仍然成功。原因是内核真正校验的是
-`struct module` 的布局（`.gnu.linkonce.this_module` 段大小），
-本项目所有 ko 都是 **1088 字节**，与设备上所有厂商 ko 一致。
+Then start the container with the limits you want:
 
-### `devtmpfs_lkm` 不要用默认参数开机自启
+```sh
+droidspaces --name=box --rootfs=<rootfs> \
+    --memory=512M --cpus=0.5 --pids-limit=64 start
+```
 
-实测中，`devtmpfs_probe=0`（默认）在开机阶段加载会导致**卡开机**。
-模块自身的 hk_patch 会改写内核只读代码段，早期加载时环境不稳定。
+`--memory` is required for the other two to land: the emulated `pids.max` and
+`cpu.max` hang off the memory controller, and Droidspaces only enables memory
+when a memory limit is configured.
 
-**始终使用 `devtmpfs_probe=2`。**
+Verify inside the container cgroup:
 
-### 硬件访问的边界
+```sh
+CG=/sys/fs/cgroup/droidspaces/<name>
+cat $CG/pids.max          # 64
+cat $CG/cpu.max           # 50000
+cat $CG/pids.stats        # refused=N, layout=1
+```
 
-`--hw-access` 能映射 `/dev/mali0`、`/dev/dma_heap`、`/dev/binder` 等节点，
-实测容器内可 `open()`。但 GPU 能否真正用于 Linux 桌面取决于驱动栈：
+Details, guarantees and limitations: [extra/cgrouplimits/README.md](extra/cgrouplimits/README.md).
 
-- 高通 Adreno：`/dev/kgsl-3d0` + Turnip（用户态 Mesa）可用 → anland 桌面可行
-- 联发科 Mali：`/dev/mali0` 是 ARM 私有 ioctl，Linux Mesa 需要
-  `CONFIG_DRM_PANFROST`（内核编译期选项）→ **标准桌面方案不可用**
+**Load them manually.** They install kprobes and resolve symbols at runtime;
+keeping them out of boot autostart means a bad interaction can never stop the
+device from booting.
 
----
+## Unsupported
 
-## 构建
+| Item | Why |
+|------|-----|
+| `USER_NS` (`--allow-sandboxing`) | Needs the whole userns core (`map_write`, `create_user_ns`, ...). With `CONFIG_USER_NS=n` that code does not exist in the image; a module cannot add it. |
 
-CI 用 SukiSU-Ultra 的 DDK 容器，其中带该 KMI 真实的 `vmlinux` /
-`Module.symvers` / 匹配的 clang：
+`--allow-sandboxing` is the only remaining gap. It is optional and does not stop
+a container from starting.
+
+## Important notes
+
+### A mismatched vermagic can still load
+
+The kernel validates the layout of `struct module` (the size of
+`.gnu.linkonce.this_module`), not only the vermagic string. Every module here is
+built to the same 1088-byte `this_module` as the vendor modules, which is why a
+ko built by the DDK loads on a device whose kernel release differs.
+
+### Never autoload `devtmpfs_lkm` with default parameters
+
+`devtmpfs_probe=0` (the default) during early boot can hang the device: the
+module rewrites kernel text and the early-boot environment is not stable.
+**Always pass `devtmpfs_probe=2`.**
+
+### Hardware access boundaries
+
+`--hw-access` maps nodes such as `/dev/mali0`, `/dev/dma_heap`, `/dev/binder`
+and they can be `open()`ed inside the container. Whether a Linux desktop can
+actually use the GPU depends on the driver stack:
+
+- Qualcomm Adreno: `/dev/kgsl-3d0` plus Turnip in userspace works — a Wayland
+  desktop over anland is viable, and needs no `vkms`.
+- ARM Mali: `/dev/mali0` is a private ioctl interface; Linux Mesa needs
+  `CONFIG_DRM_PANFROST`, which is a kernel build option. `vkms` supplies the
+  render node instead.
+
+Deployment notes for a Wayland desktop over anland:
+[docs/ANLAND-DEPLOY.md](docs/ANLAND-DEPLOY.md).
+
+## Build
+
+CI builds inside the DDK container, which carries the real `vmlinux`,
+`Module.symvers` and matching clang for each KMI:
 
 ```bash
 make -C /opt/ddk/kdir/<kmi> M=<source-dir> modules
 ```
 
-本地构建需要对应内核树，见 `docs/BUILD.md`。
+The per-KMI driver sources (vkms, macvlan) come from that KMI's own tree, not
+from a shared copy — their APIs move between releases. See
+[scripts/build_modules.sh](scripts/build_modules.sh).
 
----
+## Sources and licensing
 
-## 源码与许可证
+This project does not reimplement kernel functionality; everything is ported or
+adapted:
 
-本项目**不重新实现**任何内核功能，全部为移植与适配：
-
-| 组件 | 来源 | 许可证 |
-|------|------|--------|
-| `lkm4ctr`（`vendor/` + `glue/`） | [cyanmint/lkm4ctr](https://github.com/cyanmint/lkm4ctr) | 见其 `copying.txt`；其中 `vendor/kernel/` 源自 Linux 内核，**GPL-2.0-only** |
+| Component | Origin | License |
+|-----------|--------|---------|
+| `lkm4ctr` (`vendor/` + `glue/`) | [cyanmint/lkm4ctr](https://github.com/cyanmint/lkm4ctr) | see its `copying.txt`; `vendor/kernel/` comes from Linux, **GPL-2.0-only** |
 | `devtmpfs_lkm` / `macvlan` / `ip6table_nat` | [ai-luo2006/droidspaces-6.12-pmb110](https://github.com/ai-luo2006/droidspaces-6.12-pmb110) | GPL-2.0 |
+| `droid_lkm_pids` | port of the same project's pids Plan B | GPL-2.0 |
+| `droid_lkm_cpu` | original | GPL-2.0 |
 
-**GPL-2.0 要求分发二进制时提供对应源码。** 每个 Release 附带的
-`source-<tag>.tar.gz` 就是编出该版本 ko 的完整源码快照。
+**GPL-2.0 requires source for binaries.** Every release carries
+`source-<tag>.tar.gz`, the exact tree the `.ko` files were built from.
 
-其中 `vendor/kernel/user_namespace.c`、`vendor/kernel/nsproxy.c`、
-`vendor/kernel/pid_namespace.c`、`vendor/ipc/*` 等直接来自 Linux 内核
-（6.1.124 / android14-6.1 分支），仅做了符号重命名以支持外部模块构建。
+`vendor/kernel/user_namespace.c`, `vendor/kernel/nsproxy.c`,
+`vendor/kernel/pid_namespace.c`, `vendor/ipc/*` come from Linux
+(6.1.124 / android14-6.1) with symbol renames so they can be built out of tree.
 
----
-
-## 参考
+## References
 
 - [Droidspaces](https://github.com/ravindu644/Droidspaces-OSS)
-- [lkm4ctr](https://github.com/cyanmint/lkm4ctr) — 命名空间模块
-- [droidspaces-6.12-pmb110](https://github.com/ai-luo2006/droidspaces-6.12-pmb110) — devtmpfs / macvlan / ip6nat 实现
-- [susfs4ksu-lkm](https://github.com/inforcqb/susfs4ksu-lkm) — 本项目发布模式参考
+- [lkm4ctr](https://github.com/cyanmint/lkm4ctr)
+- [droidspaces-6.12-pmb110](https://github.com/ai-luo2006/droidspaces-6.12-pmb110)
+- [susfs4ksu-lkm](https://github.com/inforcqb/susfs4ksu-lkm) — release pattern reference
 
-**免责声明**：加载内核模块等同于以最高权限执行内核代码。仅在你能接受设备
-无法开机风险的前提下使用，并确保有恢复手段（fastboot / recovery）。
+**Disclaimer**: loading a kernel module runs kernel code with full privilege.
+Use this only if you can accept the risk of an unbootable device, and have a
+recovery path (fastboot / recovery).

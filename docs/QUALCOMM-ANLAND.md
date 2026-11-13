@@ -165,7 +165,7 @@ RUN case "$GPU_VENDOR" in \
 
 ## 高通设备实测清单
 
-设备：Redmi `2410CRP4CG` / `uke` / `pineapple`（骁龙 8 Gen 3，SM8650）
+设备：高通 SoC（`pineapple` 平台，SM8650 级）
 
 ```
 内核       6.1.138-android14-11   → KMI android14-6.1

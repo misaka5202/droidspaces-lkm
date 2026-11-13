@@ -229,7 +229,7 @@ jobs:
           # 按 KMI 拆分单包
           for f in dist/*.ko; do
             [ -f "$f" ] || continue
-            kmi=$(basename "$f" | sed -E 's/^(lkm4ctr|devtmpfs_lkm|macvlan|ip6table_nat|vkms)-(.*)\.ko$/\2/')
+            kmi=$(basename "$f" | sed -E 's/^(lkm4ctr|devtmpfs_lkm|macvlan|ip6table_nat|vkms|droid_lkm_pids|droid_lkm_cpu)-(.*)\.ko$/\2/')
             case "$kmi" in
               android*) ;;
               *) continue ;;

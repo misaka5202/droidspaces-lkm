@@ -1,6 +1,6 @@
 # anland Linux 桌面部署手册
 
-在 ** (MT6989 / Mali-G720)** 上运行 Linux 桌面，
+在 **ARM Mali 平台（G720 级 GPU）** 上运行 Linux 桌面，
 画面通过 anland 显示在 Android 屏幕上。
 
 本文档记录的是**实际验证过的步骤**，每一条都有对应的实测证据。
@@ -539,8 +539,8 @@ Wayland 平台 EGL 需要 `MESA_LOADER_DRIVER_OVERRIDE=swrast`，
 ## 关键设备信息
 
 ```
-设备:       OPPO Find X7 (PHZ110)
-SoC:        MT6989
+设备:       arm64 Android 设备（bootloader 锁定）
+SoC:        MediaTek（ARM Mali GPU）
 GPU:        Mali-G720-Immortalis MC12
 内核:       6.1.157-android14-11-o-g2d576b643492
 KMI:        android14-6.1

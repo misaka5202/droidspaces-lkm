@@ -167,6 +167,41 @@ for m in devtmpfs net_ip6nat; do
     find "$SRC" -name '.*.cmd' -delete 2>/dev/null || true
 done
 
+# ---------------------------------------------------------------------------
+# 5) droid_lkm_pids / droid_lkm_cpu —— cgroup limits 仿真
+#
+# 这两个模块在运行时解析符号并 kprobe，不依赖编译期 config；但内置的
+# KallRecon 与布局自校验是按 CGROUP_SUBSYS_COUNT 算偏移的，各 KMI 的
+# 控制器数量不同，所以每个 KMI 都要单独编、单独验。
+# ---------------------------------------------------------------------------
+for m in pids cpu; do
+    SRC="$WS/extra/cgrouplimits"
+    [ -f "$SRC/Makefile" ] || continue
+    log "=== droid_lkm_$m @ $KMI ==="
+    find "$SRC" -name '*.o' -delete 2>/dev/null || true
+    find "$SRC" -name '.*.cmd' -delete 2>/dev/null || true
+    find "$SRC" -name '*.ko' -delete 2>/dev/null || true
+    find "$SRC" -name '*.mod' -delete 2>/dev/null || true
+    rm -f "$SRC"/modules.order "$SRC"/Module.symvers 2>/dev/null || true
+    # Makefile 支持 MODULE=<name> 只编一个目标；两个模块共用一份
+    # KallRecon，同时编会让一条失败连带另一条，CI 逐个出货更稳
+    if make -C "$KDIR" M="$SRC" MODULE="droid_lkm_$m" modules -j"$NPROC"; then
+        if [ -f "$SRC/droid_lkm_$m.ko" ]; then
+            cp "$SRC/droid_lkm_$m.ko" "$OUT/droid_lkm_$m-$KMI.ko"
+            log "  [OK]"
+        else
+            warn "droid_lkm_$m @ $KMI (没有产物)"
+        fi
+    else
+        warn "droid_lkm_$m @ $KMI"
+    fi
+    find "$SRC" -name '*.o' -delete 2>/dev/null || true
+    find "$SRC" -name '.*.cmd' -delete 2>/dev/null || true
+    find "$SRC" -name '*.ko' -delete 2>/dev/null || true
+    find "$SRC" -name '*.mod' -delete 2>/dev/null || true
+    rm -f "$SRC"/modules.order "$SRC"/Module.symvers 2>/dev/null || true
+done
+
 echo
 echo "=== $KMI 产物 ==="
 ls -lh "$OUT" 2>/dev/null
