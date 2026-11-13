@@ -47,11 +47,22 @@ fi
 # 把一组 .c 编成 obj-m := <mod>.o 形式的 Makefile
 gen_makefile() {
     local dir="$1" mod="$2" extra_cflags="${3:-}"
+    local objs count single
+    objs="$(cd "$dir" && ls ./*.c 2>/dev/null | sed 's#^\./##; s#\.c$#.o#' | tr '\n' ' ')"
+    count="$(cd "$dir" && ls ./*.c 2>/dev/null | wc -l)"
+    single="$(echo "$objs" | awk '{print $1}')"
     {
         echo "obj-m := $mod.o"
-        local objs
-        objs="$(cd "$dir" && ls ./*.c 2>/dev/null | sed 's#^\./##; s#\.c$#.o#' | tr '\n' ' ')"
-        echo "$mod-y := $objs"
+        # 单文件且源码名等于模块名 (macvlan.c → macvlan.o) 时**不能**写
+        # "<mod>-y := <mod>.o": kbuild 会报
+        #   Circular <mod>.o <- <mod>.o dependency dropped
+        # 然后 ld 找不到目标文件。这种情况让 kbuild 自己按 <mod>.c 推导即可。
+        if [ "$count" -gt 1 ]; then
+            echo "$mod-y := $objs"
+        elif [ "$single" != "$mod.o" ]; then
+            # 多源或文件名与模块名不一致 (vkms_drv.c → vkms.o), 必须显式列出
+            echo "$mod-y := $objs"
+        fi
         [ -n "$extra_cflags" ] && echo "ccflags-y += $extra_cflags"
     } > "$dir/Makefile"
 }
