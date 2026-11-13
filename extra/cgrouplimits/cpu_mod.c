@@ -213,10 +213,39 @@ static void (*p_rstat_flush_hold)(struct cgroup *cgrp);
 static unsigned long long (*p_task_sched_runtime)(struct task_struct *p);
 static void (*p_rstat_flush_release)(void);
 static unsigned long ctl_bstat_off;
+static unsigned long ctl_kn_priv_off;
 
 static bool ctl_read_ptr(unsigned long addr, unsigned long *out)
 {
 	return copy_from_kernel_nofault(out, (void *)addr, sizeof(*out)) == 0;
+}
+
+/*
+ * cgroup 指针有效性校验。
+ *
+ * 没有它就会 panic（实测：`css_task_iter_advance_css_set+0x28` 空指针
+ * 解引用，地址 0x318）。原因是 xarray 里存的是裸 cgroup 指针，容器重启后
+ * 旧 cgroup 被 rmdir 释放，但条目还在；tick 遍历到它时把已释放内存当成
+ * struct cgroup 用。
+ *
+ * 两道防线：
+ *   1. kprobe cgroup_rmdir 在删除时清掉对应条目（主动回收）
+ *   2. 遍历前用 copy_from_kernel_nofault 探该 cgroup 的 kn 字段，
+ *      读不到就跳过并顺手清掉（防御残留与竞态）
+ */
+static bool ctl_cgrp_alive(struct cgroup *cgrp)
+{
+	unsigned long kn = 0;
+
+	if (!cgrp)
+		return false;
+	/* cgrp->kn 是第一个指针字段之后的常用字段，用 nofault 读避免
+	 * 触碰已释放内存时再次崩在这里 */
+	if (!ctl_read_ptr((unsigned long)cgrp + offsetof(struct cgroup, kn),
+			  &kn))
+		return false;
+	/* 活着的 cgroup 一定有 kernfs 节点 */
+	return kn != 0;
 }
 
 static void cpu_resolve_syms(void)
@@ -469,6 +498,23 @@ static void __nocfi cpu_tick(struct work_struct *w)
 		if (quota <= 0 || quota == S64_MAX)
 			continue;
 
+		/* 已释放的 cgroup：清掉条目，绝不再解引用。
+		 * 不加这一步会在 css_task_iter_advance_css_set 里
+		 * 空指针解引用 panic（已实测）。 */
+		if (!ctl_cgrp_alive(cgrp)) {
+			if (cpu_debug) {
+				static unsigned long last_dead;
+				if (time_after(jiffies, last_dead + 3 * HZ)) {
+					last_dead = jiffies;
+					pr_info("[droid_lkm_cpu] drop dead cgrp=%px\n",
+						cgrp);
+				}
+			}
+			xa_erase(&cpu_xa, idx);
+			kfree(p);
+			continue;
+		}
+
 		{
 			u64 total = cpu_read_usage(cgrp);
 			u64 wbase = atomic64_read(&p->window_usage_base);
@@ -548,6 +594,54 @@ static void __nocfi cpu_tick(struct work_struct *w)
 			      msecs_to_jiffies(CPU_TICK_MS));
 }
 
+/* ------------------------------------------------- cgroup_rmdir 清理 --- */
+
+static struct kprobe ctl_rmdir_probe;
+static bool ctl_rmdir_live;
+
+/*
+ * 容器重启会 rmdir 掉旧 cgroup，但 xarray 里存的是裸指针。这里在删除
+ * 时主动清条目，是防 panic 的第一道防线（第二道是 tick 里的
+ * ctl_cgrp_alive 校验）。
+ */
+static int __nocfi ctl_rmdir_pre(struct kprobe *p, struct pt_regs *regs)
+{
+	struct kernfs_node *kn = (struct kernfs_node *)regs->regs[0];
+	unsigned long v;
+	struct cpu_priv *cp;
+
+	if (!kn)
+		return 0;
+	if (!ctl_read_ptr((unsigned long)kn + ctl_kn_priv_off, &v))
+		return 0;
+
+	cp = xa_load(&cpu_xa, v);
+	if (cp) {
+		xa_erase(&cpu_xa, v);
+		kfree(cp);
+		if (cpu_debug)
+			pr_info("[droid_lkm_cpu] rmdir cgrp=%lx erased\n", v);
+	}
+	return 0;
+}
+
+static void cpu_install_rmdir_probe(void)
+{
+	int ret;
+
+	ctl_kn_priv_off = offsetof(struct kernfs_node, priv);
+	ctl_rmdir_probe.symbol_name = "cgroup_rmdir";
+	ctl_rmdir_probe.pre_handler = ctl_rmdir_pre;
+	ret = register_kprobe(&ctl_rmdir_probe);
+	if (ret) {
+		cpu_warn("cgroup_rmdir probe failed: %d "
+			 "(dead-entry check stays as the only guard)\n", ret);
+		return;
+	}
+	ctl_rmdir_live = true;
+	cpu_info("probed cgroup_rmdir\n");
+}
+
 /* ---------------------------------------------------------- init/exit -- */
 
 static struct cgroup_subsys *memory_ss;
@@ -580,6 +674,8 @@ static int __init droid_lkm_cpu_init(void)
 	else
 		cpu_files_live = true;
 
+	cpu_install_rmdir_probe();
+
 	INIT_DELAYED_WORK(&cpu_tick_work, cpu_tick);
 	schedule_delayed_work(&cpu_tick_work, msecs_to_jiffies(CPU_TICK_MS));
 	cpu_tick_running = true;
@@ -597,6 +693,8 @@ static void __exit droid_lkm_cpu_exit(void)
 		cancel_delayed_work_sync(&cpu_tick_work);
 		cpu_tick_running = false;
 	}
+	if (ctl_rmdir_live)
+		unregister_kprobe(&ctl_rmdir_probe);
 	if (cpu_files_live)
 		cgroup_rm_cftypes(cpu_max_files);
 
