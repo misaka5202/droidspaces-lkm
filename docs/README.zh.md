@@ -142,13 +142,26 @@ cat $CG/pids.stats        # refused=N, layout=1
 **请手动加载。** 它们会在运行时解析符号并安装 kprobe；不进开机自启，
 意味着任何异常交互都不可能让设备开不了机。
 
-## 未覆盖
+## 全覆盖
 
-| 项 | 原因 |
-|---|---|
-| `USER_NS`（`--allow-sandboxing`） | 需要整套 userns 核心路径（`map_write`、`create_user_ns` 等）。`CONFIG_USER_NS=n` 时这些代码不在镜像里，模块无法凭空补出来。 |
+Droidspaces 的每一项检查现在都通过，包括三项看起来模块补不了的：
 
-`--allow-sandboxing` 是唯一剩下的缺口。它属于可选能力，不影响容器启动。
+| 检查 | 做法 |
+|------|------|
+| `CPU limit support` | `droid_lkm_cpu` 用时间片限流仿真 `cpu.max` |
+| `Process limit support` | `droid_lkm_pids` 用 kprobe 仿真 pids 控制器 |
+| `Sandboxing (user namespaces)` | `lkm4ctr` 通过 `patches/0001-expose-ns-user.patch` 暴露 `/proc/<pid>/ns/user` |
+
+userns 这一项值得单独说明，因为它很容易做错：**发布符号链接只是做了一半。**
+`nsfs_evict()` 会无条件解引用 `ns->ns.ops`，而内核静态的 `init_user_ns`
+在 `CONFIG_USER_NS=n` 时没有 ops 初始化器。只加 procfs 条目的补丁会在该
+命名空间第一次被销毁时把内核打崩。所以补丁先照 `kernel/pid_namespace.c`
+处理 `init_pid_ns` 的方式给 init 命名空间装上 `vns_userns_operations`，
+装不上就拒绝发布符号链接。
+
+注意 `/proc/<pid>/ns/user` 响应的是**按名查找**而不是目录枚举：
+`ls /proc/self/ns/` 看不到它，但 `stat` / `access` 会成功。这正是
+Droidspaces 实际使用的探测方式。
 
 ## 重要提醒
 

@@ -222,7 +222,7 @@ jobs:
           sed -i 's/\r$//' "$STAGE"/*.sh "$STAGE/module.prop"
 
           # 全 KMI 合并包
-          ( cd "$STAGE" && zip -qr9 "$GITHUB_WORKSPACE/dist/droidspaces-lkm-arm64.zip" . )
+          ( cd "$STAGE" && zip -qr1 "$GITHUB_WORKSPACE/dist/droidspaces-lkm-arm64.zip" . )
           echo "=== 合并包内容 ==="
           unzip -l "$GITHUB_WORKSPACE/dist/droidspaces-lkm-arm64.zip"
 
@@ -240,7 +240,7 @@ jobs:
             cp ksu/module.prop ksu/service.sh ksu/customize.sh ksu/uninstall.sh ksu/action.sh "$S/"
             chmod 755 "$S"/*.sh
             sed -i 's/\r$//' "$S"/*.sh "$S/module.prop"
-            ( cd "$S" && zip -qr9 "$GITHUB_WORKSPACE/dist/droidspaces-lkm-$kmi-arm64.zip" . )
+            ( cd "$S" && zip -qr1 "$GITHUB_WORKSPACE/dist/droidspaces-lkm-$kmi-arm64.zip" . )
           done
 
           echo "=== 最终 dist ==="

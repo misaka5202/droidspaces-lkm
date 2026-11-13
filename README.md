@@ -151,14 +151,29 @@ Details, guarantees and limitations: [extra/cgrouplimits/README.md](extra/cgroup
 keeping them out of boot autostart means a bad interaction can never stop the
 device from booting.
 
-## Unsupported
+## Full coverage
 
-| Item | Why |
-|------|-----|
-| `USER_NS` (`--allow-sandboxing`) | Needs the whole userns core (`map_write`, `create_user_ns`, ...). With `CONFIG_USER_NS=n` that code does not exist in the image; a module cannot add it. |
+Every check Droidspaces performs now passes, including the three that look
+impossible from a module:
 
-`--allow-sandboxing` is the only remaining gap. It is optional and does not stop
-a container from starting.
+| Check | How |
+|-------|-----|
+| `CPU limit support` | `droid_lkm_cpu` emulates `cpu.max` with time-slice throttling |
+| `Process limit support` | `droid_lkm_pids` emulates the pids controller with kprobes |
+| `Sandboxing (user namespaces)` | `lkm4ctr` exposes `/proc/<pid>/ns/user` via `patches/0001-expose-ns-user.patch` |
+
+The userns one is worth a note because it is subtle: publishing the symlink is
+only half the job. `nsfs_evict()` dereferences `ns->ns.ops` unconditionally,
+and the kernel's static `init_user_ns` has no ops initializer when
+`CONFIG_USER_NS=n`. A patch that only adds the procfs entry crashes the kernel
+the first time that namespace is torn down. The patch therefore also installs
+`vns_userns_operations` on the init namespace first, exactly the way
+`kernel/pid_namespace.c` already handles `init_pid_ns`, and refuses to publish
+the symlink when it cannot.
+
+Note that `/proc/<pid>/ns/user` answers a name lookup, not a directory
+listing: `ls /proc/self/ns/` will not show it, but `stat`/`access` succeed.
+That is what Droidspaces actually probes.
 
 ## Important notes
 
