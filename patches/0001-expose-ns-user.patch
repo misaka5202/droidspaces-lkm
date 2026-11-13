@@ -1,0 +1,118 @@
+diff --git a/glue/vendor_kernel_procfs.c b/glue/vendor_kernel_procfs.c
+index c445664..5094010 100644
+--- a/glue/vendor_kernel_procfs.c
++++ b/glue/vendor_kernel_procfs.c
+@@ -43,6 +43,7 @@
+ #include <linux/slab.h>
+ #include <linux/spinlock.h>
+ #include <linux/version.h>
++#include <linux/user_namespace.h>
+ #include <asm/ptrace.h>
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+ #include <proc/internal.h>
+@@ -55,6 +56,14 @@
+ 
+ #define VNS_PROC_NS_IPC_NAME	"ipc"
+ #define VNS_PROC_NS_PID_NAME	"pid"
++/*
++ * user 条目同样受 #ifdef CONFIG_USER_NS 保护：fs/proc/namespaces.c 的
++ * ns_entries[] 里 &userns_operations 那一项在 CONFIG_USER_NS=n 时根本
++ * 不进数组，于是 /proc/<pid>/ns/user 永不出现 —— 即使 vendor_kernel 已经
++ * 建出真实的 user_namespace 对象。Droidspaces 用
++ * access("/proc/self/ns/user", F_OK) 判断沙箱能力。
++ */
++#define VNS_PROC_NS_USER_NAME	"user"
+ 
+ typedef struct dentry *(*vns_proc_ns_instantiate_fn_t)(struct dentry *,
+ 						       struct task_struct *,
+@@ -102,6 +111,9 @@ static DEFINE_SPINLOCK(vns_procfs_task_pids_lock);
+ static atomic_t vns_procfs_task_pid_count = ATOMIC_INIT(0);
+ static DEFINE_SPINLOCK(vns_proc_init_pid_ns_ops_lock);
+ static struct pid_namespace *vns_proc_init_pid_ns_ops_target;
++/* init_user_ns 的 ops 补位状态，语义与上面的 init_pid_ns 一致 */
++static DEFINE_SPINLOCK(vns_proc_init_user_ns_ops_lock);
++static struct user_namespace *vns_proc_init_user_ns_ops_target;
+ 
+ static struct dentry *(*vns_real_proc_ns_dir_lookup)(struct inode *dir,
+ 						     struct dentry *dentry,
+@@ -454,6 +466,62 @@ static bool vns_procfs_compat_enable_init_pidns_ops(struct task_struct *task)
+ 	return enabled;
+ }
+ 
++/*
++ * init_user_ns 在 CONFIG_USER_NS=n 的内核上没有 ns.ops 初始化器，
++ * 而 nsfs_evict() 无条件解引用它。发布 /proc/<pid>/ns/user 之前必须
++ * 先把 ops 补上，否则 nsfs 销毁时会在 nsfs_evict() 里空指针崩溃
++ * （实测：pc=nsfs_evict+0x20, lr=vendor_kernel_hook_nsfs_evict+0x20）。
++ *
++ * 与 init_pid_ns 的处理完全对称：
++ *   - 原生 USER_NS 存在时不动，内核自己设好了 ops
++ *   - 只认真正的 init 对象：level==0、parent==NULL、inum 已分配
++ *   - 只装一次，竞争下由自旋锁裁决
++ */
++static bool vns_proc_init_user_ns_ops_ensure(struct task_struct *task)
++{
++	struct user_namespace *active;
++	const struct proc_ns_operations *ops;
++	unsigned long flags;
++	bool enabled = false;
++
++	if (vns_native_userns_core_is_available())
++		return false;
++	if (!task || !task->cred)
++		return false;
++
++	rcu_read_lock();
++	active = task->cred->user_ns;
++	if (!active) {
++		rcu_read_unlock();
++		return false;
++	}
++	ops = READ_ONCE(active->ns.ops);
++	if (ops == &vns_userns_operations) {
++		rcu_read_unlock();
++		return true;
++	}
++	if (ops || READ_ONCE(active->level) != 0 ||
++	    READ_ONCE(active->parent) || !active->ns.inum) {
++		rcu_read_unlock();
++		return false;
++	}
++	rcu_read_unlock();
++
++	spin_lock_irqsave(&vns_proc_init_user_ns_ops_lock, flags);
++	ops = READ_ONCE(active->ns.ops);
++	if (!ops && !vns_proc_init_user_ns_ops_target) {
++		WRITE_ONCE(active->ns.ops, &vns_userns_operations);
++		vns_proc_init_user_ns_ops_target = active;
++		enabled = true;
++	} else if (ops == &vns_userns_operations &&
++		   vns_proc_init_user_ns_ops_target == active) {
++		enabled = true;
++	}
++	spin_unlock_irqrestore(&vns_proc_init_user_ns_ops_lock, flags);
++	return enabled;
++}
++
++
+ void vns_procfs_compat_resolve(void)
+ {
+ 	vendor_kernel_proc_evict_inode_hook.quiesce_exempt = true;
+@@ -542,6 +610,17 @@ static struct dentry *vendor_kernel_hook_proc_ns_dir_lookup(
+ 			   dentry->d_name.len)) {
+ 		native = READ_ONCE(vns_pidns_runtime_supported);
+ 		ns_ops = &vns_pidns_operations;
++	} else if (dentry->d_name.len == strlen(VNS_PROC_NS_USER_NAME) &&
++		   !memcmp(dentry->d_name.name, VNS_PROC_NS_USER_NAME,
++			   dentry->d_name.len)) {
++		/*
++		 * 发布符号链接之前先补 init_user_ns 的 ops：nsfs_evict()
++		 * 会解引用它，而 CONFIG_USER_NS=n 时内核从未设过。
++		 */
++		if (!vns_proc_init_user_ns_ops_ensure(current))
++			return res;
++		native = false;
++		ns_ops = &vns_userns_operations;
+ 	} else {
+ 		return res;
+ 	}
