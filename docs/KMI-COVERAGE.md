@@ -1,74 +1,128 @@
 # 模块 × KMI 覆盖
 
-每个 KMI 的包从 `droidspaces-lkm-<kmi>-arm64.zip` 下载，
-或从全 KMI 合并包 `droidspaces-lkm-arm64.zip` 里按 `/proc/sys/kernel/osrelease`
-自动选。
+**5 个模块 × 7 个 KMI = 35/35，全部齐全。**
 
 | 模块 | 12-5.10 | 13-5.10 | 13-5.15 | 14-5.15 | 14-6.1 | 15-6.6 | 16-6.12 |
 |------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | `lkm4ctr` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `devtmpfs_lkm` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `macvlan` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `ip6table_nat` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `vkms` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `ip6table_nat` | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
-4 个模块做到了全 KMI 覆盖；`ip6table_nat` 缺两个 5.10。
+下载全 KMI 合并包 `droidspaces-lkm-arm64.zip`（开机按 `osrelease` 自动选），
+或按 KMI 精确下载 `droidspaces-lkm-<kmi>-arm64.zip`。
 
-## 为什么同一个模块在不同 KMI 上会不一样
+## 构建方式
 
-这些模块有的是**内核树里的普通驱动文件**，API 随版本变化。把某个版本的
-源码拿去编另一个版本必然失败，所以构建脚本为每个 KMI 使用**它自己内核树里
-的**源码（`/opt/ddk/src/<kmi>`）：
+每个 KMI 用**它自己内核树里的**驱动源码（DDK 镜像的 `/opt/ddk/src/<kmi>`），
+不是跨版本共用一份副本：
 
-- `vkms` —— 取自 `drivers/gpu/drm/vkms/`，再补 `DRIVER_RENDER`
-- `macvlan` —— 取自 `drivers/net/macvlan.c`
-- `lkm4ctr` —— 上游自己做了版本适配，直接用
-- `devtmpfs_lkm` / `ip6table_nat` —— 本仓库实现，内核里没有可对应的独立驱动
+| 模块 | 源码来源 |
+|------|---------|
+| `vkms` | `drivers/gpu/drm/vkms/` + `DRIVER_RENDER` 补丁 |
+| `macvlan` | `drivers/net/macvlan.c` |
+| `lkm4ctr` | 上游仓库（已自带版本适配） |
+| `devtmpfs_lkm` | 本仓库实现 |
+| `ip6table_nat` | 本仓库实现（含 5.10/5.15/6.1+ 三套签名分支） |
 
 ## vkms 的 DRIVER_RENDER 补丁
 
 上游 vkms 的 `driver_features` 是 `MODESET | ATOMIC | GEM`，没有
-`DRIVER_RENDER`，因此 `drm_dev_register()` 不会分配 render minor ——
-只有一个 card 节点，没有 `/dev/dri/renderD*`。
-
-而 Wayland 合成器要的正是 render node（`gbm_create_device()` +
-`drmOpenRender()`）。补上这个标志后同一个模块同时提供两半：
+`DRIVER_RENDER`。而 `drm_dev_register()` 只有看到这个标志才分配 render
+minor —— 于是未打补丁的 vkms 只创建 card，没有 `/dev/dri/renderD<N>`：
 
 ```
-crw-rw-rw- root graphics 226,  1  card1        ← KMS 管线
-crw-rw-rw- root graphics 226,128  renderD128   ← render node
+crw-rw-rw- 226,   1  card1          ← 有
+                                     ← renderD128 没有
+```
+
+Wayland 合成器走 `gbm_create_device()` + `drmOpenRender()`，要的正是 render
+node，缺它就会停在：
+
+```
+CRIT: Couldn't open a gbm device   (OpenGL.cpp:351)
+```
+
+补上后同一个模块同时提供两半：
+
+```
+crw-rw----  system system   226,   0  card0        (厂商显示控制器)
+crw-rw-rw-  root   graphics 226,   1  card1        ← vkms KMS 管线
+crw-rw-rw-  root   graphics 226, 128  renderD128   ← vkms render node
 ```
 
 `DRIVER_RENDER` 只允许创建 render minor，不改变 vkms 的 ioctl 集合。
 
-## ip6table_nat 的两个 5.10 缺口
+补丁由 `scripts/patch_vkms_driver_features.py` 完成，`build_modules.sh` 在
+编译前会**二次校验**文件里确实有 `DRIVER_RENDER`，没有就不出货。
 
-5.10 与 6.1 之间这三个 API 有实质变化，补齐需要为 5.10 写独立实现分支：
+## 5.10 与 5.15+ 的 API 差异
 
-```
-ip6t_register_table      5.10 期望 5 个参数, 6.1 是 4 个
-xt_find_table            参数类型不同
-xt_register_template     5.10 头文件里没有对外声明
-```
+`ip6table_nat` 需要三套分支，分界线在两个位置：
 
-`ip6table_nat` 只负责 IPv6 NAT（Droidspaces 的 `--net=nat` 容器互访），
-属于可选能力。缺失时容器仍可正常启动，只是 IPv6 NAT 不可用。
+| API | 5.10 | 5.15+ | 6.1+ |
+|-----|:---:|:---:|:---:|
+| `ip6t_do_table` | `(skb,state,table)` | 同 5.10 | `(priv,skb,state)` |
+| `ip6t_register_table` | 5 参数（+`**res`） | 4 参数 | 4 参数 |
+| `ip6t_unregister_table_exit` | `(net,table)` | `(net,name)` | `(net,name)` |
+| `xt_register_template` | **不存在** | 有 | 有 |
+| `xt_find_table` | **不存在** | 有 | 有 |
 
-## 已知的构建陷阱
+5.10 上表存在 `net->ipv6.ip6table_nat`，注册时直接从那个字段取回，不需要
+`xt_find_table`；module_init 也只对 `init_net` 建一次表，不走 template 机制。
+
+## 构建陷阱
 
 调试过程中踩到的，都已在脚本里处理：
 
 | 现象 | 原因 |
 |------|------|
-| `Circular <mod>.o <- <mod>.o dependency dropped` | 单文件模块写了 `<mod>-y := <mod>.o`，源码名已等于模块名时 kbuild 会自己推导，多写一行就是自依赖 |
+| 全部 KMI「成功」但 vkms 产物 0 个 | `build_modules.sh` 记录失败后 `exit 0`（故意，为了不让一个 KMI 阻断其他），所以**矩阵全绿不代表产物齐全** |
+| `vkms` 能加载但无 renderD128 | 补丁用的内联 heredoc 正则被 shell 转义吃掉（`[^,\n]` 变成真实换行），补丁静默失效 |
+| `Circular <mod>.o <- <mod>.o dependency dropped` | 单文件模块写了 `<mod>-y := <mod>.o`，源码名等于模块名时 kbuild 自己推导，多写一行就是自依赖 |
 | `'LINUX_VERSION_CODE' is not defined` | 缺 `<linux/version.h>`，`-Werror,-Wundef` 直接失败 |
 | `unknown type name 'u8'` | 补声明写进了被 `-include` 强制前置的头文件，那时 `u8` 还没定义 |
 | `-Wgcc-compat` 报 `for (int i = ...)` | 老 KMI 的 Makefile 用 `-std=gnu89` + `-Werror` |
 | `linux/mnt_idmapping.h: No such file` | 该头 6.3 才引入；compat 层已把 `nop_mnt_idmap` 映射到 `init_user_ns`，include 加版本判断即可 |
-| `xwayland` / `kwin` 的 `.deb` 装了但二进制没变 | deb 保留了原时间戳，且 dpkg 对同版本号会跳过；用 `dpkg -i --force-overwrite`，并用 md5 对比 deb 内容确认 |
+| `No such file or directory` 但看不到缺什么 | 把 `if_macvlan.h` 复制进模块目录不满足 `#include <linux/if_macvlan.h>`，要从内核 include 路径解析 |
 
-## 校验方式
+## 判断覆盖度的方法
 
-CI 的矩阵「全绿」不代表产物齐全：`build_modules.sh` 会记录每个 KMI 的失败项
-然后 **exit 0**，好让一个编不过的 KMI 不阻断其他 KMI 出货。判断覆盖度必须看
-Release 里实际的 `.ko` 列表，不能看 job 状态。
+**不要看 CI job 状态。** 看 Release 里实际的 `.ko` 列表：
+
+```bash
+gh release view <tag> --json assets -q '.assets[].name' \
+  | grep -E '\.ko$' | sed 's/-android[0-9]*-[0-9.]*\.ko$//' | sort | uniq -c
+```
+
+或者解压每个 KMI 包数一下：
+
+```bash
+for z in droidspaces-lkm-android*.zip; do
+  echo "$z: $(unzip -l "$z" | grep -c '\.ko$') 个"
+done
+```
+
+## 真机验证记录
+
+`android14-6.1`（OPPO Find X7，MT6989）实测通过：
+
+```
+$ insmod vkms-android14-6.1.ko
+[drm] Initialized vkms 1.0.0 20180514 for vkms on minor 1
+
+$ ls -la /dev/dri/
+crw-rw-rw-  root graphics 226,   1  card1
+crw-rw-rw-  root graphics 226, 128  renderD128
+
+$ droidspaces --name=vtest --anland --gpu start
+Container: vtest (RUNNING)   HW access: GPU   Anland: enabled
+容器内: crw-rw---- root droidspaces-gpu 226, 128 renderD128
+```
+
+`ip6table_nat` 加载时自解析符号：
+
+```
+[ip6t-nat-shim] self-resolved 9/9 symbols
+```
