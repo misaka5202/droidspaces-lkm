@@ -44,6 +44,8 @@
 #include <linux/version.h>
 #include <linux/workqueue.h>
 #include <linux/jiffies.h>
+#include <linux/sysctl.h>
+#include <linux/namei.h>
 #include <linux/fs.h>
 #include <linux/file.h>
 #include <linux/vmalloc.h>
@@ -647,6 +649,72 @@ static void cpu_install_rmdir_probe(void)
 static struct cgroup_subsys *memory_ss;
 static bool cpu_files_live;
 
+/* --------------------------------------------------- sched sysctl 补位 ---
+ *
+ * Droidspaces 判定 CPU limit 可用性的条件是：
+ *
+ *   access("/proc/sys/kernel/sched_cfs_bandwidth_slice_us", F_OK) == 0 &&
+ *       ds_cgroup_has_controller("cpu")
+ *
+ * 第二项由显示层（cgroup.controllers 里补 "cpu"）满足，第一项不行：
+ * 这个 sysctl 是 CONFIG_CFS_BANDWIDTH 保护下的注册项，config=n 时内核
+ * 根本不建这个文件，所以 access() 必然 ENOENT，--cpus 被跳过。
+ *
+ * 内核把它定义在 kernel/sched/fair.c 的 sched_fair_sysctl 表里：
+ *
+ *     .procname     = "sched_cfs_bandwidth_slice_us",
+ *     .data         = &sysctl_sched_cfs_bandwidth_slice,   // 默认 5000
+ *     .maxlen       = sizeof(unsigned int),
+ *     .mode         = 0644,
+ *     .proc_handler = proc_dointvec_minmax,
+ *     .extra1       = SYSCTL_ONE,
+ *
+ * register_sysctl() 是 EXPORT_SYMBOL，模块可以真的注册一张同名表，
+ * 于是那个路径会真实存在、可读可写，而不是靠伪造 stat 骗过 access()。
+ *
+ * 设备的 CONFIG_RANDSTRUCT_NONE=y，struct ctl_table 布局可靠，
+ * 可以静态初始化。若哪天换成 RANDSTRUCT_FULL，这里会读到错位的
+ * 字段——所以只在运行时校验 layout 之后再注册（见 cpu_sysctl_register）。
+ */
+static unsigned int cpu_cfs_slice_us = 5000;
+
+static struct ctl_table cpu_sched_sysctls[] = {
+	{
+		.procname	= "sched_cfs_bandwidth_slice_us",
+		.data		= &cpu_cfs_slice_us,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ONE,
+	},
+	{}
+};
+
+static struct ctl_table_header *cpu_sysctl_hdr;
+
+static void cpu_sysctl_register(void)
+{
+	struct path p;
+
+	if (cpu_sysctl_hdr)
+		return;
+	/* 只补上真正缺的那一项；内核自己注册过就别重复建 */
+	if (kern_path("/proc/sys/kernel/sched_cfs_bandwidth_slice_us",
+		      LOOKUP_FOLLOW, &p) == 0) {
+		path_put(&p);
+		cpu_info("sched_cfs_bandwidth_slice_us already present\n");
+		return;
+	}
+	cpu_sysctl_hdr = register_sysctl("kernel", cpu_sched_sysctls);
+	if (IS_ERR_OR_NULL(cpu_sysctl_hdr)) {
+		cpu_warn("register_sysctl failed: %ld\n",
+			 cpu_sysctl_hdr ? PTR_ERR(cpu_sysctl_hdr) : -ENOMEM);
+		cpu_sysctl_hdr = NULL;
+		return;
+	}
+	cpu_info("registered sched_cfs_bandwidth_slice_us\n");
+}
+
 static int __init droid_lkm_cpu_init(void)
 {
 	unsigned long mem_ss_addr;
@@ -675,6 +743,7 @@ static int __init droid_lkm_cpu_init(void)
 		cpu_files_live = true;
 
 	cpu_install_rmdir_probe();
+	cpu_sysctl_register();
 
 	INIT_DELAYED_WORK(&cpu_tick_work, cpu_tick);
 	schedule_delayed_work(&cpu_tick_work, msecs_to_jiffies(CPU_TICK_MS));
@@ -695,6 +764,10 @@ static void __exit droid_lkm_cpu_exit(void)
 	}
 	if (ctl_rmdir_live)
 		unregister_kprobe(&ctl_rmdir_probe);
+	if (cpu_sysctl_hdr) {
+		unregister_sysctl_table(cpu_sysctl_hdr);
+		cpu_sysctl_hdr = NULL;
+	}
 	if (cpu_files_live)
 		cgroup_rm_cftypes(cpu_max_files);
 
