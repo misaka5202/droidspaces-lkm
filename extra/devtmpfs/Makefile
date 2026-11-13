@@ -30,4 +30,4 @@ CFLAGS_devtmpfs.o := -include $(src)/compat_61.h
 ccflags-y += -I$(src) -I$(src)/hk -I$(src)/kr
 ccflags-y += -Wno-declaration-after-statement -Wno-unused-variable \
 	-Wno-unused-function -Wno-strict-prototypes -Wno-missing-prototypes \
-	-Wno-incompatible-function-pointer-types
+	-Wno-incompatible-function-pointer-types -Wno-gcc-compat

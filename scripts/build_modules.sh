@@ -82,25 +82,40 @@ if [ -n "$KSRC" ] && [ -d "$KSRC/drivers/gpu/drm/vkms" ]; then
     rm -f "$DST/Makefile" "$DST/Kconfig"
 
     if ! grep -q 'DRIVER_RENDER' "$DST/vkms_drv.c" 2>/dev/null; then
-        # 在 driver_features 那一行末尾追加 DRIVER_RENDER
-        python3 - "$DST/vkms_drv.c" <<'PYEOF' 2>/dev/null || \
-            sed -i 's/DRIVER_MODESET | DRIVER_ATOMIC | DRIVER_GEM/DRIVER_MODESET | DRIVER_ATOMIC | DRIVER_GEM | DRIVER_RENDER/' "$DST/vkms_drv.c"
+        # 在 driver_features 的最后一个标志后追加 " | DRIVER_RENDER"。
+        # 不能动那个逗号: .driver_features = A | B | C,  追加要插在 C 之后、
+        # 逗号之前, 否则会得到 "... | C, | DRIVER_RENDER," 这种东西。
+        python3 - "$DST/vkms_drv.c" <<'PYEOF' || true
 import re, sys
 p = sys.argv[1]
-s = open(p, encoding='utf-8').read()
-# .driver_features = A | B | C,   →  .driver_features = A | B | C | DRIVER_RENDER,
-def repl(m):
+try:
+    s = open(p, encoding='utf-8').read()
+except OSError:
+    sys.exit(1)
+if 'DRIVER_RENDER' in s:
+    sys.exit(0)
+
+m = re.search(r'\.driver_features\s*=\s*([^,
+]+)', s)
+if m:
     body = m.group(1).rstrip()
-    if 'DRIVER_RENDER' in body:
-        return m.group(0)
-    return '.driver_features' + m.group(0)[len('.driver_features'):m.end(1)] + ' | DRIVER_RENDER,'
-s2 = re.sub(r'\.driver_features\s*=\s*([^,\n}]+),', repl, s, count=1)
-if s2 == s:                      # 没匹配到就退回最简单的替换
-    s2 = s.replace('DRIVER_MODESET | DRIVER_ATOMIC | DRIVER_GEM',
-                   'DRIVER_MODESET | DRIVER_ATOMIC | DRIVER_GEM | DRIVER_RENDER')
-open(p, 'w', encoding='utf-8').write(s2)
+    s = s[:m.start(1)] + body + ' | DRIVER_RENDER' + s[m.end(1):]
+else:
+    # 没有 driver_features 字段就把整个结构体加上
+    s = s.replace('DRIVER_MODESET | DRIVER_ATOMIC | DRIVER_GEM',
+                  'DRIVER_MODESET | DRIVER_ATOMIC | DRIVER_GEM | DRIVER_RENDER')
+try:
+    open(p, 'w', encoding='utf-8').write(s)
+except OSError:
+    sys.exit(1)
 PYEOF
+        # python3 可能不存在(容器极简), 用 sed 兜底
+        if ! grep -q 'DRIVER_RENDER' "$DST/vkms_drv.c" 2>/dev/null; then
+            sed -i -E 's/(\.driver_features[^=]*=[^
+]*[^,[:space:]])([[:space:]]*,)/ | DRIVER_RENDER/' "$DST/vkms_drv.c"
+        fi
     fi
+
     log "  driver_features: $(grep -h 'driver_features' "$DST/vkms_drv.c" 2>/dev/null | head -1 | tr -s ' ')"
 
     gen_makefile "$DST" vkms "-DCONFIG_DRM_VKMS=1"
@@ -120,11 +135,10 @@ log "=== macvlan @ $KMI ==="
 DST=/tmp/mod-macvlan
 rm -rf "$DST"; mkdir -p "$DST"
 if [ -n "$KSRC" ] && [ -f "$KSRC/drivers/net/macvlan.c" ]; then
+    # 只复制 .c, 不复制头文件: macvlan.c 用的是 #include <linux/if_macvlan.h>,
+    # 那个头必须从内核树的 include 路径解析。把副本塞进模块目录反而会因为它
+    # 自己内部又 include 别的东西而失败 (表现为 "No such file or directory")
     cp "$KSRC/drivers/net/macvlan.c" "$DST/"
-    # 6.1 及更早的 macvlan 需要 if_macvlan.h; 新版本已并入 uapi
-    for h in include/linux/if_macvlan.h include/uapi/linux/if_macvlan.h; do
-        [ -f "$KSRC/$h" ] && cp "$KSRC/$h" "$DST/"
-    done
     gen_makefile "$DST" macvlan "-DCONFIG_MACVLAN=1"
     if make -C "$KDIR" M="$DST" modules -j"$NPROC"; then
         cp "$DST/macvlan.ko" "$OUT/macvlan-$KMI.ko" && log "  [OK]"
