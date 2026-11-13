@@ -158,11 +158,19 @@ impossible from a module:
 
 | Check | How |
 |-------|-----|
-| `CPU limit support` | `droid_lkm_cpu` emulates `cpu.max` with time-slice throttling |
+| `CPU limit support` | `droid_lkm_cpu` emulates `cpu.max`, and registers the `sched_cfs_bandwidth_slice_us` sysctl the check also wants |
 | `Process limit support` | `droid_lkm_pids` emulates the pids controller with kprobes |
 | `Sandboxing (user namespaces)` | `lkm4ctr` exposes `/proc/<pid>/ns/user` via `patches/0001-expose-ns-user.patch` |
 
-The userns one is worth a note because it is subtle: publishing the symlink is
+The CPU one has a second precondition that is easy to miss: Droidspaces also
+requires `/proc/sys/kernel/sched_cfs_bandwidth_slice_us` to exist, and that sysctl
+is registered from `kernel/sched/fair.c` inside `#ifdef CONFIG_CFS_BANDWIDTH`, so
+a kernel with the config off never creates the file. The module registers a real
+table with `register_sysctl()` in the same shape fair.c uses (0644,
+`proc_dointvec_minmax`, default 5000), so the path is readable and writable
+rather than faked.
+
+The userns one is worth a note too, because it is subtle: publishing the symlink is
 only half the job. `nsfs_evict()` dereferences `ns->ns.ops` unconditionally,
 and the kernel's static `init_user_ns` has no ops initializer when
 `CONFIG_USER_NS=n`. A patch that only adds the procfs entry crashes the kernel

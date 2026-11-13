@@ -148,7 +148,7 @@ Droidspaces 的每一项检查现在都通过，包括三项看起来模块补�
 
 | 检查 | 做法 |
 |------|------|
-| `CPU limit support` | `droid_lkm_cpu` 用时间片限流仿真 `cpu.max` |
+| `CPU limit support` | `droid_lkm_cpu` 仿真 `cpu.max` + 补注册 `sched_cfs_bandwidth_slice_us` sysctl |
 | `Process limit support` | `droid_lkm_pids` 用 kprobe 仿真 pids 控制器 |
 | `Sandboxing (user namespaces)` | `lkm4ctr` 通过 `patches/0001-expose-ns-user.patch` 暴露 `/proc/<pid>/ns/user` |
 
@@ -158,6 +158,12 @@ userns 这一项值得单独说明，因为它很容易做错：**发布符号�
 命名空间第一次被销毁时把内核打崩。所以补丁先照 `kernel/pid_namespace.c`
 处理 `init_pid_ns` 的方式给 init 命名空间装上 `vns_userns_operations`，
 装不上就拒绝发布符号链接。
+
+CPU limit 那一项也有一个容易被忽略的前提：Droidspaces 要求
+`/proc/sys/kernel/sched_cfs_bandwidth_slice_us` 存在，而这个 sysctl 是
+`CONFIG_CFS_BANDWIDTH` 保护下注册的，config=n 时内核根本不建。模块用
+`register_sysctl()` 真的注册了一张同形状的表（0644、`proc_dointvec_minmax`、
+默认 5000），所以那个路径可读可写，不是靠伪造 stat 骗过检查。
 
 注意 `/proc/<pid>/ns/user` 响应的是**按名查找**而不是目录枚举：
 `ls /proc/self/ns/` 看不到它，但 `stat` / `access` 会成功。这正是
