@@ -118,8 +118,16 @@ load_mod ip6table_nat ""
 load_mod macvlan ""
 load_mod vkms ""
 
+# cgroup 限流仿真（--cpus / --pids-limit）。
+# 装 kprobe 并在运行时解析符号，最坏表现是加载失败；
+# 放最后，失败不挡前面五个模块。
+# 想临时关掉：在模块目录放 disable_pids / disable_cpu。
+MODDIR="/data/adb/modules/droidspaces_lkm"
+[ -f "$MODDIR/disable_pids" ] || load_mod droid_lkm_pids ""
+[ -f "$MODDIR/disable_cpu" ] || load_mod droid_lkm_cpu ""
+
 echo "--- lsmod ---" >> "$LOG"
-lsmod | grep -E '^(lkm4ctr|devtmpfs_lkm|ip6table_nat|macvlan|vkms)' >> "$LOG" 2>/dev/null
+lsmod | grep -E '^(lkm4ctr|devtmpfs_lkm|ip6table_nat|macvlan|vkms|droid_lkm_pids|droid_lkm_cpu)' >> "$LOG" 2>/dev/null
 
 echo "--- 能力验证 ---" >> "$LOG"
 unshare -pf true 2>/dev/null \
@@ -131,6 +139,12 @@ unshare -i true 2>/dev/null \
 grep -q devtmpfs /proc/filesystems 2>/dev/null \
     && echo "[OK] devtmpfs" >> "$LOG" \
     || echo "[--] devtmpfs 未注册" >> "$LOG"
+grep -q "^droid_lkm_pids " /proc/modules 2>/dev/null \
+    && echo "[OK] pids 控制器仿真" >> "$LOG" \
+    || echo "[--] pids 控制器仿真未加载" >> "$LOG"
+grep -q "^droid_lkm_cpu " /proc/modules 2>/dev/null \
+    && echo "[OK] cpu.max 仿真" >> "$LOG" \
+    || echo "[--] cpu.max 仿真未加载" >> "$LOG"
 
 # vkms 提供的 render node: anland / wayland 合成器的前提
 if [ -e /dev/dri/renderD128 ]; then
