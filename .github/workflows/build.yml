@@ -35,6 +35,11 @@ on:
         required: false
         type: string
         default: 'lkm4ctr'
+      version:
+        description: 'Release 版本标签, 例 v1.0.0; 留空则用 v<日期>-<时间>'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: write
@@ -257,45 +262,88 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          TAG="v$(date +%Y%m%d-%H%M%S)"
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            TAG="${INPUT_VERSION}"
+            [ "${TAG#v}" = "$TAG" ] && TAG="v$TAG"
+          else
+            TAG="v$(date +%Y%m%d-%H%M%S)"
+          fi
           {
-            echo "在原始 GKI 内核上补齐 Droidspaces 所需的容器能力，无需重编内核。"
+            echo "在原始 GKI 内核上补齐 Droidspaces 所需的全部容器能力，无需重编内核、无需刷 boot。"
+            echo
+            echo "装完后 \`droidspaces check\` 的所有检查项都是 ✓，包括 CPU 限额、进程数限额和 user namespace 沙箱。"
             echo
             echo "### 包含的模块"
             echo
-            echo '| 模块 | 作用 | 补齐的 CONFIG |'
-            echo '|---|---|---|'
-            echo '| `lkm4ctr` | 命名空间核心 | `PID_NS` `UTS_NS` `IPC_NS` `SYSVIPC` `POSIX_MQUEUE` |'
-            echo '| `devtmpfs_lkm` | 注册 devtmpfs | `DEVTMPFS` |'
-            echo '| `macvlan` | 容器独立 IP | `MACVLAN` |'
-            echo '| `ip6table_nat` | IPv6 NAT | `IP6_NF_NAT` `IP6_NF_TARGET_MASQUERADE` |'
+            echo '| 模块 | 作用 | 补齐的 CONFIG | 开机自启 |'
+            echo '|---|---|---|:---:|'
+            echo '| `lkm4ctr` | 命名空间核心 | `PID_NS` `UTS_NS` `IPC_NS` `SYSVIPC` `POSIX_MQUEUE` `USER_NS` | ✅ |'
+            echo '| `devtmpfs_lkm` | 注册 devtmpfs | `DEVTMPFS` | ✅ |'
+            echo '| `macvlan` | 容器独立局域网 IP | `MACVLAN` | ✅ |'
+            echo '| `ip6table_nat` | IPv6 NAT | `IP6_NF_NAT` `IP6_NF_TARGET_MASQUERADE` | ✅ |'
+            echo '| `vkms` | 虚拟 DRM, 提供 render node | `DRM_VKMS` | ✅ |'
+            echo '| `droid_lkm_pids` | 仿真 pids 控制器 | `CGROUP_PIDS` | ✅ |'
+            echo '| `droid_lkm_cpu` | 仿真 cpu.max + 补注册 sysctl | `CFS_BANDWIDTH` | ✅ |'
+            echo
+            echo "### 支持的 KMI"
+            echo
+            echo '`android12-5.10` `android13-5.10` `android13-5.15` `android14-5.15` `android14-6.1` `android15-6.6` `android16-6.12`'
+            echo
+            echo '仅 arm64。'
             echo
             echo "### 安装"
             echo
-            echo '刷入 `droidspaces-lkm-arm64.zip`（全 KMI）或 `droidspaces-lkm-<kmi>-arm64.zip`（单 KMI），重启。'
+            echo '任选其一：'
             echo
-            echo '手动加载时 `devtmpfs_lkm` 请带 `devtmpfs_probe=2`：'
+            echo '1. `droidspaces-lkm-arm64.zip` — 全 KMI 合并包，开机按 `/proc/sys/kernel/osrelease` 自动选匹配的 ko（推荐）'
+            echo '2. `droidspaces-lkm-<kmi>-arm64.zip` — 只含单个 KMI，包更小'
+            echo
+            echo '在 KernelSU / APatch 管理器里刷入后重启即可。七个模块默认全部加载。'
+            echo
+            echo "### 手动加载"
             echo
             echo '```sh'
+            echo 'insmod lkm4ctr-<kmi>.ko'
             echo 'insmod devtmpfs_lkm-<kmi>.ko devtmpfs_probe=2'
+            echo 'insmod ip6table_nat-<kmi>.ko'
+            echo 'insmod macvlan-<kmi>.ko'
+            echo 'insmod vkms-<kmi>.ko'
+            echo 'insmod droid_lkm_pids-<kmi>.ko'
+            echo 'insmod droid_lkm_cpu-<kmi>.ko'
             echo '```'
             echo
-            echo "### 未覆盖"
+            echo '`devtmpfs_lkm` 必须带 `devtmpfs_probe=2`。默认的 `probe=0` 会启动 kthread 并改写内核只读代码段，开机阶段加载会导致卡开机。'
             echo
-            echo '`CFS_BANDWIDTH` `CGROUP_PIDS` `USER_NS` —— 均需内核编译期支持，无法在运行时补。'
+            echo '想临时关掉某个 cgroup 模块，在模块目录放 `disable_pids` / `disable_cpu` 文件即可（模块仍安装，只是不加载）。'
+            echo
+            echo "### 用法"
+            echo
+            echo '```sh'
+            echo 'droidspaces --name=box --rootfs=<rootfs> '
+            echo '    --memory=512M --cpus=0.5 --pids-limit=64 '
+            echo '    --allow-sandboxing start'
+            echo '```'
+            echo
+            echo '`--memory` 是另外两项生效的前提：仿真的 `pids.max` 与 `cpu.max` 挂在 memory 控制器上，Droidspaces 只在配置了内存限制时才启用 memory。'
+            echo
+            echo "### 已验证"
+            echo
+            echo '真机（MTK 6.1.157 / GKI `android14-6.1`）：'
+            echo
+            echo '- `droidspaces check` 全部 ✓，包括 `CPU limit support`、`Process limit support`、`Sandboxing (user namespaces)`'
+            echo '- `--pids-limit=64`：容器内 fork 80 次失败 25 次，`refused=25`'
+            echo '- `--cpus=0.5`：`over quota (65994 >= 50000), SIGSTOP` → `window reset, SIGCONT` 循环生效'
+            echo '- `/proc/self/ns/user` → `user:[4026531837]`，压力测试 100 次读取 + 20 次开闭无 panic'
             echo
             echo "### 源码"
             echo
-            echo 'GPL-2.0 要求随二进制提供源码，见 `source-*.tar.gz`。'
+            echo 'GPL-2.0 要求随二进制提供源码，见 `source-*.tar.gz`（编出本版本 ko 的完整源码快照，含本地补丁）。'
             echo
             echo "### 免责"
             echo
             echo '加载内核模块等同以最高权限执行内核代码。请确保有 fastboot / recovery 恢复手段。'
           } > notes.md
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Droidspaces LKM $TAG" \
-            --notes-file notes.md \
-            dist/*.ko dist/*.zip dist/source-*.tar.gz
+          gh release create "$TAG"             --repo "$GITHUB_REPOSITORY"             --title "Droidspaces LKM $TAG"             --notes-file notes.md             dist/*.ko dist/*.zip dist/source-*.tar.gz
