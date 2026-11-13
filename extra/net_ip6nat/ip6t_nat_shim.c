@@ -198,6 +198,27 @@ void __nocfi droid_nat_ip6t_unregister_table_exit(struct net *net,
 		net->ipv6.ip6table_nat = NULL;
 	}
 }
+
+/*
+ * 5.10 专用: core.c 已经拿着 xt_table* 时直接走这个, 不再按 name 查找。
+ * 名字不带 ip6t_ 前缀, 所以不受 #define 影响, 也就没有声明冲突。
+ */
+void __nocfi droid_nat_ip6t_unregister_table_exit_tbl(struct net *net,
+						      struct xt_table *table)
+{
+	void (*fn)(struct net *, struct xt_table *);
+
+	if (unlikely(!a_unregister_table_exit)) {
+		nat_warn_once("ip6t_unregister_table_exit");
+		return;
+	}
+	if (!table)
+		return;
+	fn = (void (*)(struct net *, struct xt_table *))a_unregister_table_exit;
+	fn(net, table);
+	if (net->ipv6.ip6table_nat == table)
+		net->ipv6.ip6table_nat = NULL;
+}
 #endif
 
 /*

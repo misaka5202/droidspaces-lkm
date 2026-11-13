@@ -24,6 +24,12 @@
 extern struct xt_table *__nocfi droid_nat_xt_find_table(struct net *net, u8 af,
                                                         const char *name);
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
+/* 5.10 专用: 直接接受 xt_table* 的注销入口 */
+extern void __nocfi droid_nat_ip6t_unregister_table_exit_tbl(
+                                struct net *net, struct xt_table *table);
+#endif
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
 /* 老内核的 hook 入口: priv 里带着 xt_table, 转交给老签名的 do_table */
 extern unsigned int __nocfi droid_nat_ip6t_do_table_legacy(
@@ -180,8 +186,16 @@ static int ip6table_nat_table_init(struct net *net)
 	}
 
 	ret = ip6t_nat_register_lookups(net);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
+	/* 5.10 的 ip6t_unregister_table_exit 收的是 xt_table*, 而且
+	 * #define 已把调用改名为 shim, 所以直接按该形状传表指针。 */
+	if (ret < 0 && net->ipv6.ip6table_nat)
+		droid_nat_ip6t_unregister_table_exit_tbl(net,
+						net->ipv6.ip6table_nat);
+#else
 	if (ret < 0)
 		ip6t_unregister_table_exit(net, "nat");
+#endif
 
 	kfree(repl);
 	return ret;
@@ -194,7 +208,13 @@ static void __net_exit ip6table_nat_net_pre_exit(struct net *net)
 
 static void __net_exit ip6table_nat_net_exit(struct net *net)
 {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
+	if (net->ipv6.ip6table_nat)
+		droid_nat_ip6t_unregister_table_exit_tbl(net,
+						net->ipv6.ip6table_nat);
+#else
 	ip6t_unregister_table_exit(net, "nat");
+#endif
 }
 
 static struct pernet_operations ip6table_nat_net_ops = {
