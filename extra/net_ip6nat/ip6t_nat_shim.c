@@ -7,6 +7,7 @@
  * 地址为 0 时返回优雅失败值，不会跳转到 0。
  */
 
+#include <linux/version.h>
 #include <linux/module.h>
 #include <linux/types.h>
 #include <linux/kernel.h>
@@ -174,12 +175,20 @@ unsigned int __nocfi droid_nat_ip6t_do_table(struct sk_buff *skb,
 /*
  * 老内核上 nf_hookfn 已经是 (void *priv, skb, state), 但真实 ip6t_do_table
  * 要的是 (skb, state, table)。priv 里放的就是那个 xt_table, 取出来传下去。
+ *
+ * 这段必须留在 #else 里: 新版内核的 droid_nat_ip6t_do_table 是
+ * (priv, skb, state), 在这里按 (skb, state, table) 调用会直接类型不符。
  */
 unsigned int __nocfi droid_nat_ip6t_do_table_legacy(void *priv,
 						    struct sk_buff *skb,
 						    const struct nf_hook_state *state)
 {
-	typeof(&droid_nat_ip6t_do_table) fn = (void *)a_do_table;
+	/* a_do_table 是 unsigned long 形态的运行时地址, 先转成函数指针 */
+	unsigned int (*fn)(struct sk_buff *, const struct nf_hook_state *,
+	                   struct xt_table *) =
+		(unsigned int (*)(struct sk_buff *,
+		                  const struct nf_hook_state *,
+		                  struct xt_table *))a_do_table;
 
 	if (unlikely(!fn)) {
 		nat_warn_once("ip6t_do_table");

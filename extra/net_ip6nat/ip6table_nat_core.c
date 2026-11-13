@@ -6,6 +6,7 @@
  * funded by Astaro.
  */
 
+#include <linux/version.h>
 #include <linux/module.h>
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv6.h>
@@ -22,6 +23,13 @@
  */
 extern struct xt_table *__nocfi droid_nat_xt_find_table(struct net *net, u8 af,
                                                         const char *name);
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
+/* 老内核的 hook 入口: priv 里带着 xt_table, 转交给老签名的 do_table */
+extern unsigned int __nocfi droid_nat_ip6t_do_table_legacy(
+                                void *priv, struct sk_buff *skb,
+                                const struct nf_hook_state *state);
+#endif
 
 struct ip6table_nat_pernet {
 	struct nf_hook_ops *nf_nat_ops;
