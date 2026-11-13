@@ -31,27 +31,54 @@ static const struct xt_table nf_nat_ipv6_table = {
 	.af		= NFPROTO_IPV6,
 };
 
+/*
+ * ip6t_do_table 的签名在 6.1 变了:
+ *
+ *   5.15 及更早: unsigned int ip6t_do_table(struct sk_buff *skb,
+ *                                          const struct nf_hook_state *state,
+ *                                          struct xt_table *table)
+ *   6.1 及更新:  unsigned int ip6t_do_table(void *priv, struct sk_buff *skb,
+ *                                          const struct nf_hook_state *state)
+ *
+ * 而 nf_hookfn 本身在 5.15 就已经是 (void *priv, sk_buff*, state*) 了。
+ * 直接把它当 .hook 赋进去, 老内核上是把 3 参数函数指针塞进 3 参数的槽,
+ * 类型对不上 (老内核的第三个参数是 xt_table*, 不是 nf_hook_state*)。
+ *
+ * 这里用一个薄 wrapper 把两边接起来: 新版直接转发; 老版从 priv 取回
+ * xt_table, 再按老签名调用。
+ */
+static unsigned int __nocfi droid_nat_hook_entry(void *priv,
+                                                 struct sk_buff *skb,
+                                                 const struct nf_hook_state *state)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+    return droid_nat_ip6t_do_table(priv, skb, state);
+#else
+    return droid_nat_ip6t_do_table_legacy(priv, skb, state);
+#endif
+}
+
 static const struct nf_hook_ops nf_nat_ipv6_ops[] = {
 	{
-		.hook		= ip6t_do_table,
+		.hook		= droid_nat_hook_entry,
 		.pf		= NFPROTO_IPV6,
 		.hooknum	= NF_INET_PRE_ROUTING,
 		.priority	= NF_IP6_PRI_NAT_DST,
 	},
 	{
-		.hook		= ip6t_do_table,
+		.hook		= droid_nat_hook_entry,
 		.pf		= NFPROTO_IPV6,
 		.hooknum	= NF_INET_POST_ROUTING,
 		.priority	= NF_IP6_PRI_NAT_SRC,
 	},
 	{
-		.hook		= ip6t_do_table,
+		.hook		= droid_nat_hook_entry,
 		.pf		= NFPROTO_IPV6,
 		.hooknum	= NF_INET_LOCAL_OUT,
 		.priority	= NF_IP6_PRI_NAT_DST,
 	},
 	{
-		.hook		= ip6t_do_table,
+		.hook		= droid_nat_hook_entry,
 		.pf		= NFPROTO_IPV6,
 		.hooknum	= NF_INET_LOCAL_IN,
 		.priority	= NF_IP6_PRI_NAT_SRC,

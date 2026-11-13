@@ -22,4 +22,37 @@
 #define nf_nat_ipv6_register_fn		droid_nat_nf_nat_ipv6_register_fn
 #define nf_nat_ipv6_unregister_fn	droid_nat_nf_nat_ipv6_unregister_fn
 
+/*
+ * shim 函数的显式声明。
+ *
+ * 正常情况下上面的 #define 会连带把内核头文件里的 extern 声明改名, 编译器
+ * 因此知道这些函数的原型。但老内核(5.10/5.15)的头文件里个别声明并不存在
+ * (例如 xt_find_table 的声明在 net/netfilter/x_tables.h, 部分版本不对外
+ * 暴露), 于是 core.c 调用时被判为隐式声明并因 -Werror 中断。
+ *
+ * 这里补一套完整的原型: 签名与 shim.c 的定义一致, 重复声明是合法的。
+ */
+struct net;
+struct sk_buff;
+struct nf_hook_state;
+struct nf_hook_ops;
+struct xt_table;
+struct ip6t_replace;
+
+void *droid_nat_ip6t_alloc_initial_table(const struct xt_table *t);
+int droid_nat_ip6t_register_table(struct net *net,
+                                  const struct xt_table *table,
+                                  const struct ip6t_replace *repl,
+                                  const struct nf_hook_ops *ops);
+void droid_nat_ip6t_unregister_table_exit(struct net *net, const char *name);
+struct xt_table *droid_nat_xt_find_table(struct net *net, u8 af,
+                                         const char *name);
+int droid_nat_xt_register_template(const struct xt_table *table,
+                                   int (*table_init)(struct net *net));
+void droid_nat_xt_unregister_template(const struct xt_table *table);
+int droid_nat_nf_nat_ipv6_register_fn(struct net *net,
+                                      const struct nf_hook_ops *ops);
+void droid_nat_nf_nat_ipv6_unregister_fn(struct net *net,
+                                         const struct nf_hook_ops *ops);
+
 #endif /* IP6T_NAT_SHIM_H */

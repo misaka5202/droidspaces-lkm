@@ -136,6 +136,16 @@ void __nocfi droid_nat_ip6t_unregister_table_exit(struct net *net,
 	fn(net, name);
 }
 
+/*
+ * ip6t_do_table 的签名随内核版本变化。上面 #define 已把内核头里的声明改名到
+ * droid_nat_ip6t_do_table, 所以这里的定义必须和**当前内核**的签名完全一致,
+ * 否则编译器会在宏展开处报类型不匹配。
+ *
+ *   6.1+  : (void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
+ *   <=5.15: (struct sk_buff *skb, const struct nf_hook_state *state,
+ *            struct xt_table *table)
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 unsigned int __nocfi droid_nat_ip6t_do_table(void *priv, struct sk_buff *skb,
 					     const struct nf_hook_state *state)
 {
@@ -147,6 +157,37 @@ unsigned int __nocfi droid_nat_ip6t_do_table(void *priv, struct sk_buff *skb,
 	}
 	return fn(priv, skb, state);
 }
+#else
+unsigned int __nocfi droid_nat_ip6t_do_table(struct sk_buff *skb,
+					     const struct nf_hook_state *state,
+					     struct xt_table *table)
+{
+	typeof(&ip6t_do_table) fn = (void *)a_do_table;
+
+	if (unlikely(!fn)) {
+		nat_warn_once("ip6t_do_table");
+		return NF_ACCEPT;
+	}
+	return fn(skb, state, table);
+}
+
+/*
+ * 老内核上 nf_hookfn 已经是 (void *priv, skb, state), 但真实 ip6t_do_table
+ * 要的是 (skb, state, table)。priv 里放的就是那个 xt_table, 取出来传下去。
+ */
+unsigned int __nocfi droid_nat_ip6t_do_table_legacy(void *priv,
+						    struct sk_buff *skb,
+						    const struct nf_hook_state *state)
+{
+	typeof(&droid_nat_ip6t_do_table) fn = (void *)a_do_table;
+
+	if (unlikely(!fn)) {
+		nat_warn_once("ip6t_do_table");
+		return NF_ACCEPT;
+	}
+	return fn(skb, state, (struct xt_table *)priv);
+}
+#endif
 
 struct xt_table *__nocfi droid_nat_xt_find_table(struct net *net, u8 af,
 						 const char *name)
