@@ -222,6 +222,24 @@ With all three, on a 6.1.157 vendor kernel: `unshare -Ur` maps root,
 all succeed inside the namespace -- on the host and inside a Droidspaces
 container.
 
+Two more namespaces had the opposite problem: the kernel supports them natively
+and lkm4ctr was stubbing them out.
+
+| Namespace | Before | After |
+|-----------|--------|-------|
+| `NET_NS` | `unshare -n` silently kept the caller's namespace; `--net=macvlan` failed with "could not create eth0" | real netns, `--net=macvlan` works |
+| `CGROUP_NS` | `unshare -C` kept the caller's namespace | real cgroup namespace |
+
+`copy_net_ns` was called with `flags & ~CLONE_NEWNET`, and `vns_copy_cgroup_ns`
+ignored its flags entirely. Both were deliberate: the real `copy_net_ns` path
+once corrupted the percpu_counters list. Both functions start with
+`inc_ucount(user_ns)`, which walks `ns->ucounts` and edits a global hashtable --
+accounting a vendored user_namespace does not take part in, which is also what
+the `dec_rlimit_ucounts` underflow warnings in dmesg were. Passing the real
+`init_user_ns` (what a `CONFIG_USER_NS=n` kernel substitutes at these call
+sites) removes the vendored namespace from that code entirely, and the native
+implementation then does the right thing.
+
 Note that `/proc/<pid>/ns/user` answers a name lookup, not a directory
 listing: `ls /proc/self/ns/` will not show it, but `stat`/`access` succeed.
 That is what Droidspaces actually probes.

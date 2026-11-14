@@ -197,6 +197,21 @@ userns 这一项要**三个修复叠加**，少任何一个都只会得到一个
 `uid_map`/`gid_map` 接受 65536 的范围，tmpfs / proc / bind 挂载全部成功 ——
 宿主机和 Droidspaces 容器内都一样。
 
+另外两个 namespace 是**相反**的问题：内核本来就支持，是 lkm4ctr 把它们 stub 掉了。
+
+| namespace | 修复前 | 修复后 |
+|-----------|--------|--------|
+| `NET_NS` | `unshare -n` 静默保持调用方的 ns；`--net=macvlan` 报 "could not create eth0" | 真实 netns，`--net=macvlan` 可用 |
+| `CGROUP_NS` | `unshare -C` 保持调用方的 ns | 真实 cgroup namespace |
+
+原实现给 `copy_net_ns` 传 `flags & ~CLONE_NEWNET`，而 `vns_copy_cgroup_ns`
+直接忽略 flags。这两处都是**刻意的**：真实 `copy_net_ns` 路径曾导致
+percpu_counters 链表损坏。这两个函数开头都是 `inc_ucount(user_ns)`，它会沿
+`ns->ucounts` 走并改全局哈希表 —— 而 vendored user_namespace 不参与那套记账，
+dmesg 里的 `dec_rlimit_ucounts` 下溢警告正是同一个错配。改传真实
+`init_user_ns`（`CONFIG_USER_NS=n` 的内核自己在这些调用点用的就是它），
+就把 vendored ns 完全排除在外，原生实现随即正常工作。
+
 CPU limit 那一项也有一个容易被忽略的前提：Droidspaces 要求
 `/proc/sys/kernel/sched_cfs_bandwidth_slice_us` 存在，而这个 sysctl 是
 `CONFIG_CFS_BANDWIDTH` 保护下注册的，config=n 时内核根本不建。模块用
