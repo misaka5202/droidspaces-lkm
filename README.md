@@ -82,10 +82,13 @@ drop a `disable_pids` / `disable_cpu` file in the module directory.
 
 ### Option A — KernelSU / APatch module (recommended)
 
-Download `droidspaces-lkm-<kmi>-arm64.zip` from
-[Releases](../../releases/latest), flash it in the manager, reboot.
+Download `droidspaces-lkm-arm64.zip` from [Releases](../../releases/latest),
+flash it in the manager, reboot.
 
 The module picks the `.ko` matching `/proc/sys/kernel/osrelease` at boot.
+
+The zip carries an `updateJson`, so the manager offers later releases directly;
+no need to come back here for a new version.
 
 ### Option B — manual insmod
 
@@ -115,17 +118,19 @@ unshare -pf true && echo "PID ns OK"
 droidspaces check                          # "All required features found!"
 ```
 
-## Supported KMI
+## Supported kernels
 
-| KMI | Kernel | Build |
-|-----|--------|:---:|
-| `android12-5.10` | 5.10 | auto |
-| `android13-5.10` | 5.10 | auto |
-| `android13-5.15` | 5.15 | auto |
-| `android14-5.15` | 5.15 | auto |
-| `android14-6.1` | 6.1 | auto |
-| `android15-6.6` | 6.6 | auto |
-| `android16-6.12` | 6.12 | auto |
+| File | Android / kernel |
+|---|---|
+| `droidspaces-lkm-android12-5.10-arm64.zip` | Android 12 / 5.10 |
+| `droidspaces-lkm-android13-5.10-arm64.zip` | Android 13 / 5.10 |
+| `droidspaces-lkm-android13-5.15-arm64.zip` | Android 13 / 5.15 |
+| `droidspaces-lkm-android14-5.15-arm64.zip` | Android 14 / 5.15 |
+| `droidspaces-lkm-android14-6.1-arm64.zip` | Android 14 / 6.1 |
+| `droidspaces-lkm-android15-6.6-arm64.zip` | Android 15 / 6.6 |
+| `droidspaces-lkm-android16-6.12-arm64.zip` | Android 16 / 6.12 |
+
+`droidspaces-lkm-arm64.zip` carries all seven and picks the right one at boot.
 
 **arm64 only.** Non-GKI kernels and non-ARM64 devices are not supported.
 

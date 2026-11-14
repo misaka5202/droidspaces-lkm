@@ -77,8 +77,10 @@ cgroup 控制器。多数厂商内核为了通过 GKI ABI 检查把这些都编�
 
 ### 方式一：KernelSU / APatch 模块（推荐）
 
-从 [Releases](../../releases/latest) 下载 `droidspaces-lkm-<kmi>-arm64.zip`，
+从 [Releases](../../releases/latest) 下载 `droidspaces-lkm-arm64.zip`，
 在管理器里刷入，重启。
+
+包内带 `updateJson`，后续版本管理器会直接提示更新，不用再回这里下载。
 
 模块会按 `/proc/sys/kernel/osrelease` 自动选择匹配当前 KMI 的 `.ko`。
 
@@ -108,17 +110,19 @@ unshare -pf true && echo "PID ns OK"
 droidspaces check                          # 应显示 All required features found!
 ```
 
-## 支持的 KMI
+## 支持的内核
 
-| KMI | 内核 | 构建 |
-|-----|------|:---:|
-| `android12-5.10` | 5.10 | 自动 |
-| `android13-5.10` | 5.10 | 自动 |
-| `android13-5.15` | 5.15 | 自动 |
-| `android14-5.15` | 5.15 | 自动 |
-| `android14-6.1` | 6.1 | 自动 |
-| `android15-6.6` | 6.6 | 自动 |
-| `android16-6.12` | 6.12 | 自动 |
+| 文件 | Android / 内核 |
+|---|---|
+| `droidspaces-lkm-android12-5.10-arm64.zip` | Android 12 / 5.10 |
+| `droidspaces-lkm-android13-5.10-arm64.zip` | Android 13 / 5.10 |
+| `droidspaces-lkm-android13-5.15-arm64.zip` | Android 13 / 5.15 |
+| `droidspaces-lkm-android14-5.15-arm64.zip` | Android 14 / 5.15 |
+| `droidspaces-lkm-android14-6.1-arm64.zip` | Android 14 / 6.1 |
+| `droidspaces-lkm-android15-6.6-arm64.zip` | Android 15 / 6.6 |
+| `droidspaces-lkm-android16-6.12-arm64.zip` | Android 16 / 6.12 |
+
+`droidspaces-lkm-arm64.zip` 包含全部七种，开机按内核自动选。
 
 **仅 arm64。** 非 GKI 内核、非 ARM64 设备不受支持。
 

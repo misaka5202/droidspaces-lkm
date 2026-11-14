@@ -1,0 +1,6 @@
+{
+  "version": "v1.0",
+  "versionCode": 10000,
+  "zipUrl": "https://github.com/misaka5202/droidspaces-lkm/releases/download/v1.0/droidspaces-lkm-arm64.zip",
+  "changelog": "https://raw.githubusercontent.com/misaka5202/droidspaces-lkm/master/docs/CHANGELOG.md"
+}
