@@ -88,7 +88,12 @@ flash it in the manager, reboot.
 The module picks the `.ko` matching `/proc/sys/kernel/osrelease` at boot.
 
 The zip carries an `updateJson`, so the manager offers later releases directly;
-no need to come back here for a new version.
+no need to come back here for a new version. If `raw.githubusercontent.com` is
+unreachable on your network, point `updateJson` at the jsDelivr mirror instead:
+
+```
+updateJson=https://cdn.jsdelivr.net/gh/misaka5202/droidspaces-lkm@master/update.json
+```
 
 ### Option B — manual insmod
 

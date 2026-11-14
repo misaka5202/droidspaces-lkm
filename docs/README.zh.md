@@ -81,6 +81,11 @@ cgroup 控制器。多数厂商内核为了通过 GKI ABI 检查把这些都编�
 在管理器里刷入，重启。
 
 包内带 `updateJson`，后续版本管理器会直接提示更新，不用再回这里下载。
+如果所在网络访问不了 `raw.githubusercontent.com`，把 `updateJson` 换成 jsDelivr 镜像：
+
+```
+updateJson=https://cdn.jsdelivr.net/gh/misaka5202/droidspaces-lkm@master/update.json
+```
 
 模块会按 `/proc/sys/kernel/osrelease` 自动选择匹配当前 KMI 的 `.ko`。
 
