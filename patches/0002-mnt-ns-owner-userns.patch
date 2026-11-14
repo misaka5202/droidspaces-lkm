@@ -1,0 +1,100 @@
+diff --git a/vendor/kernel/nsproxy.c b/vendor/kernel/nsproxy.c
+index 31d9e2a..02d8049 100644
+--- a/vendor/kernel/nsproxy.c
++++ b/vendor/kernel/nsproxy.c
+@@ -44,7 +44,13 @@
+ #include <linux/nsproxy.h>
+ #include <linux/init_task.h>
+ #include <linux/mnt_namespace.h>
++#include <linux/ns_common.h>
++#include <linux/user_namespace.h>
+ #include <linux/utsname.h>
++
++/* struct mount 的完整定义在私有头 fs/mount.h，这里只要指针，前向声明即可。 */
++struct mount;
++
+ #include <linux/pid_namespace.h>
+ #include <net/net_namespace.h>
+ #include <linux/ipc_namespace.h>
+@@ -268,6 +274,36 @@ static inline struct nsproxy *create_nsproxy(void)
+  * matching the pattern used elsewhere in this module (see e.g.
+  * vendor_kernel_procfs_userns.c's vns_idmap_create_fd()).
+  */
++/*
++ * [MNT-USERNS] struct mnt_namespace 的 user_ns 字段偏移。
++ *
++ * 完整定义在私有头 fs/mount.h（6.1 布局，字段顺序见下），模块看不到。
++ * GKI 内核全部是 CONFIG_RANDSTRUCT_NONE=y，字段顺序 == 源码顺序，所以用
++ * 一份前缀假结构就能拿到 user_ns 的偏移。写之前会用
++ * vns_real_init_user_ns 做运行时校验：CONFIG_USER_NS=n 下 get_user_ns()
++ * 恒返回 init，因此真实 copy_mnt_ns() 建出的 mnt_ns 此刻的 user_ns 必是
++ * init —— 读到 init 才说明偏移正确，才改写；否则跳过，宁可不修 mount
++ * 也不写坏内存。
++ *
++ * 6.1 fs/mount.h：
++ *   struct mnt_namespace {
++ *       struct ns_common        ns;      // offset 0
++ *       struct mount *          root;
++ *       struct list_head        list;
++ *       spinlock_t              ns_lock;
++ *       struct user_namespace * user_ns; // <-- 目标字段
++ *       struct ucounts *        ucounts;
++ *       ...
++ *   } __randomize_layout;
++ */
++struct vns_mnt_namespace {
++	struct ns_common	ns;
++	struct mount		*root;
++	struct list_head	list;
++	spinlock_t		ns_lock;
++	struct user_namespace	*user_ns;
++};
++
+ static __nocfi struct nsproxy *create_new_namespaces(unsigned long flags,
+ 	struct task_struct *tsk, struct user_namespace *user_ns,
+ 	struct fs_struct *new_fs)
+@@ -286,6 +322,44 @@ static __nocfi struct nsproxy *create_new_namespaces(unsigned long flags,
+ 			err = PTR_ERR(new_nsp->mnt_ns);
+ 			goto out_ns;
+ 		}
++		/*
++		 * [MNT-USERNS] 把新 mount namespace 的归属修正回调用方给的
++		 * user_ns。
++		 *
++		 * 真实内核在 CONFIG_USER_NS=n 下把 get_user_ns() 编成
++		 *
++		 *     static inline struct user_namespace *get_user_ns(
++		 *                     struct user_namespace *ns)
++		 *     {
++		 *             return &init_user_ns;   // 忽略参数
++		 *     }
++		 *
++		 * 而 copy_mnt_ns() 用 alloc_mnt_ns(user_ns) 里的 get_user_ns()
++		 * 设置 new_ns->user_ns，于是新 mnt ns 永远"属于" init_user_ns。
++		 *
++		 * mount(2) 入口的 may_mount() 做
++		 *     ns_capable(current->nsproxy->mnt_ns->user_ns, CAP_SYS_ADMIN)
++		 * 拿 init（level 0）去对处于子 userns（level 1）的 cred 比较，
++		 * cap_capable() 直接返回 -EPERM —— 表现为 user namespace 内
++		 * 任何挂载（tmpfs / proc / bind）都 EPERM，而真 root 在 init 里
++		 * unshare -m 再挂载却正常。
++		 *
++		 * 这里只在确实进了子 userns（user_ns != init）时改写，所以
++		 * Android init 自己开机时的 unshare(CLONE_NEWNS)（user_ns 仍是
++		 * init）不会走进这个分支。CONFIG_USER_NS=n 下 get/put_user_ns
++		 * 都是空实现，没有引用计数要配平，直接赋值不会泄漏。
++		 *
++		 * 偏移用 vns_mnt_namespace 假结构 + init_user_ns 运行时校验
++		 * （见上面 struct vns_mnt_namespace 的注释），读不到 init 就
++		 * 跳过，宁可 mount 继续 EPERM 也不写坏内存。
++		 */
++		if (user_ns && new_nsp->mnt_ns &&
++		    user_ns != vns_real_init_user_ns) {
++			struct vns_mnt_namespace *vmnt =
++				(struct vns_mnt_namespace *)new_nsp->mnt_ns;
++			if (READ_ONCE(vmnt->user_ns) == vns_real_init_user_ns)
++				WRITE_ONCE(vmnt->user_ns, user_ns);
++		}
+ 	} else {
+ 		new_nsp->mnt_ns = NULL;
+ 	}
