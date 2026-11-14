@@ -428,10 +428,10 @@ index 0000000..08d0d2f
 +.size hk_flush_icache, . - hk_flush_icache
 diff --git a/glue/hk/hk_inline.c b/glue/hk/hk_inline.c
 new file mode 100644
-index 0000000..eeaed5d
+index 0000000..9a326b4
 --- /dev/null
 +++ b/glue/hk/hk_inline.c
-@@ -0,0 +1,1438 @@
+@@ -0,0 +1,1508 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Copyright (C) 2026 dere3046
@@ -1037,10 +1037,30 @@ index 0000000..eeaed5d
 +					  int node,
 +					  const void *caller);
 +
-+static __nocfi noinline void *hk_exec_alloc(unsigned long size)
++/*
++ * [B-RANGE] 优先把 trampoline 分配到"目标附近"。
++ *
++ * arm64 的 4 字节 b 只能跳 ±128MB。模块区和内核镜像之间在 VA_BITS=39 的
++ * 机器上能隔出几十 GB（本机实测 ~95GB），所以从 VMALLOC 区间随机分配出来
++ * 的 trampoline 几乎必然够不到，只能退回 20 字节的绝对跳转桩 —— 那个桩要求
++ * 函数入口能容纳 5 条指令，像 __arm64_sys_msgget 这种 bti+mov+mov+b 的包装
++ * 就装不下。
++ *
++ * 内核镜像周围是 vmalloc 空洞（KIMAGE_VADDR 就在 VMALLOC 区间起点附近，镜像
++ * 被 KASLR 往上挪，下面的空间没人用）。把 trampoline 放在 [目标 - 120MB,
++ * 目标 - 4MB] 里，b 就够得着，改写窗口缩到 1 条指令，任何函数都能 inline。
++ *
++ * 分配失败（空洞不够）就退回原来的 VMALLOC 区间分配。
++ */
++#define HK_NEAR_MASK	0x7ffffffUL	/* 128MB，b 的量程 */
++#define HK_NEAR_TRIES	4
++
++static __nocfi noinline void *hk_exec_alloc(unsigned long near, unsigned long size)
 +{
 +	hk_vmalloc_node_range_fn fn;
 +	const char *name = "__vmalloc_node_range";
++	void *mem = NULL;
++	int i;
 +
 +#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 +	name = "__vmalloc_node_range_noprof";
@@ -1048,6 +1068,28 @@ index 0000000..eeaed5d
 +	fn = (hk_vmalloc_node_range_fn)hk_resolve(name);
 +	if (!fn || !hk_ker_addr_ok((unsigned long)fn))
 +		return NULL;
++
++	if (near) {
++		unsigned long lo = near - (HK_NEAR_MASK - SZ_16M);	/* -112MB */
++		unsigned long hi = near - SZ_4M;			/* -4MB  */
++
++		for (i = 0; i < HK_NEAR_TRIES && !mem; i++) {
++			mem = fn(size, 1, lo, hi,
++				 GFP_KERNEL | __GFP_NOWARN, PAGE_KERNEL_EXEC,
++				 VM_FLUSH_RESET_PERMS, NUMA_NO_NODE,
++				 __builtin_return_address(0));
++			/* 换个更靠近目标的小区间再试一次 */
++			hi = lo + (hi - lo) / 2;
++		}
++		/* 够得着才留 */
++		if (mem && ((unsigned long)mem - near + HK_NEAR_MASK) > (2 * HK_NEAR_MASK)) {
++			vfree(mem);
++			mem = NULL;
++		}
++	}
++	if (mem)
++		return mem;
++
 +	return fn(size, 1, VMALLOC_START, VMALLOC_END,
 +		  GFP_KERNEL | __GFP_NOWARN, PAGE_KERNEL_EXEC,
 +		  VM_FLUSH_RESET_PERMS, NUMA_NO_NODE,
@@ -1336,6 +1378,7 @@ index 0000000..eeaed5d
 +	unsigned long mem;
 +	u32 saved[HK_INLINE_ENTRY_MAX];
 +	u32 i;
++	bool near_ok;
 +	int ret;
 +
 +	memset(h, 0, sizeof(*h));
@@ -1354,7 +1397,7 @@ index 0000000..eeaed5d
 +	 * install after this point and the relocation must not read the patched
 +	 * text again
 +	 */
-+	for (i = 0; i < HK_INLINE_ENTRY_MAX; i++) {
++	for (i = 0; i < h->window / 4; i++) {
 +		ret = hk_fetch_insn(addr + i * 4, &saved[i]);
 +		if (ret) {
 +			pr_warn("[lkmhook] inline %s entry is not readable\n",
@@ -1367,14 +1410,14 @@ index 0000000..eeaed5d
 +		h->saved[i * 4 + 2] = (saved[i] >> 16) & 0xFF;
 +		h->saved[i * 4 + 3] = (saved[i] >> 24) & 0xFF;
 +	}
-+	ret = hk_inline_short(saved, HK_INLINE_ENTRY_MAX);
++	ret = hk_inline_short(saved, h->window / 4);
 +	if (ret) {
 +		pr_warn("[lkmhook] inline %s is shorter than the window, breakpoint route\n",
 +			sym);
 +		goto err_free;
 +	}
 +
-+	mem = (unsigned long)hk_exec_alloc(HK_TRAMP_SIZE);
++	mem = (unsigned long)hk_exec_alloc(addr, HK_TRAMP_SIZE);
 +	if (!mem) {
 +		pr_warn("[lkmhook] inline exec alloc %s failed\n", sym);
 +		ret = -ENOMEM;
@@ -1383,8 +1426,14 @@ index 0000000..eeaed5d
 +	h->mem = (void *)mem;
 +	h->mem_size = HK_TRAMP_SIZE;
 +	h->addr = addr;
-+	h->window = HK_INLINE_PATCH_LEN;
 +	h->name = sym;
++
++	/*
++	 * [B-RANGE] trampoline 落在 b 的量程内就只改写 1 条指令（4 字节 b），
++	 * 否则退回 5 条指令窗口 + 20 字节绝对跳转桩。
++	 */
++	near_ok = ((mem > addr) ? (mem - addr) : (addr - mem)) <= HK_NEAR_MASK;
++	h->window = near_ok ? 4 : HK_INLINE_PATCH_LEN;
 +
 +	tramp[0] = HK_INS_BTI_JC;
 +	tramp[1] = HK_INS_LDR_X17;
@@ -1397,10 +1446,10 @@ index 0000000..eeaed5d
 +	ctx.dst = tramp + 6;
 +	ctx.src = h->saved;
 +	ctx.tramp_start = addr;
-+	ctx.tramp_end = addr + HK_INLINE_PATCH_LEN;
++	ctx.tramp_end = addr + h->window;
 +	ctx.backup_start = mem + 24;
 +
-+	for (i = 0; i < HK_INLINE_ENTRY_MAX; i++) {
++	for (i = 0; i < h->window / 4; i++) {
 +		ctx.inst_addr = addr + i * 4;
 +		ret = hk_relo_inst(&ctx, saved[i]);
 +		if (ret) {
@@ -1416,11 +1465,11 @@ index 0000000..eeaed5d
 +	 * applies: br x17 stays when the attribute can be cleared, otherwise ret
 +	 * x17 is used, which is a return and has no landing pad requirement
 +	 */
-+	ctx.inst_addr = addr + HK_INLINE_PATCH_LEN;
++	ctx.inst_addr = addr + h->window;
 +	h->use_br_x17 = true;
-+	if (hk_bti_guard_track(h, addr + HK_INLINE_PATCH_LEN))
++	if (hk_bti_guard_track(h, addr + h->window))
 +		h->use_br_x17 = false;
-+	ret = hk_relo_stub(&ctx, addr + HK_INLINE_PATCH_LEN, h->use_br_x17);
++	ret = hk_relo_stub(&ctx, addr + h->window, h->use_br_x17);
 +	if (ret)
 +		goto err_guard;
 +
@@ -1435,20 +1484,41 @@ index 0000000..eeaed5d
 +	 * through stop_machine: no core is running while the entry changes from
 +	 * the caller's bytes to bti jc plus an absolute jump
 +	 */
-+	detour[0] = HK_INS_BTI_JC;
-+	detour[1] = HK_INS_LDR_X17;
-+	detour[2] = HK_INS_RET_X17;
-+	detour[3] = mem & 0xFFFFFFFF;
-+	detour[4] = mem >> 32;
-+	ret = hk_engine_write((void *)addr, detour, HK_INLINE_PATCH_LEN);
-+	if (ret) {
-+		hk_engine_write((void *)addr, h->saved, HK_INLINE_PATCH_LEN);
-+		goto err_guard;
++	if (near_ok) {
++		/*
++		 * [B-RANGE] trampoline 在 ±128MB 内：入口只需一条 b。
++		 * 这是最省的改写 —— 完全不需要 bti 落地板、不需要字面量池，
++		 * 窗口也只有 4 字节，连 bti+mov+mov+b 这种短包装都装得下。
++		 */
++		long delta = (long)(mem - addr);
++		u32 insn = 0x14000000u | ((u32)(delta >> 2) & 0x03FFFFFFu);
++
++		detour[0] = insn;
++		ret = hk_engine_write((void *)addr, detour, 4);
++		if (ret) {
++			hk_engine_write((void *)addr, h->saved, h->window);
++			goto err_guard;
++		}
++	} else {
++		/*
++		 * trampoline 太远：bti jc ; ldr x17,#8 ; br/ret x17 ; .quad mem
++		 * 共 20 字节，因此窗口必须是 5 条指令。
++		 */
++		detour[0] = HK_INS_BTI_JC;
++		detour[1] = HK_INS_LDR_X17;
++		detour[2] = HK_INS_RET_X17;
++		detour[3] = mem & 0xFFFFFFFF;
++		detour[4] = mem >> 32;
++		ret = hk_engine_write((void *)addr, detour, HK_INLINE_PATCH_LEN);
++		if (ret) {
++			hk_engine_write((void *)addr, h->saved, h->window);
++			goto err_guard;
++		}
 +	}
 +
 +	kfree(tramp);
-+	pr_info("[lkmhook] inline %s addr=0x%lx tramp=0x%lx words=%u br_x17=%u\n",
-+		sym, addr, mem, ctx.count, h->use_br_x17 ? 1 : 0);
++	pr_info("[lkmhook] inline %s addr=0x%lx tramp=0x%lx words=%u window=%u near=%d br_x17=%u\n",
++		sym, addr, mem, ctx.count, h->window, (int)near_ok, h->use_br_x17 ? 1 : 0);
 +	return 0;
 +
 +err_guard:
@@ -1536,7 +1606,7 @@ index 0000000..eeaed5d
 +		mutex_unlock(&g_inline_lock);
 +		return 0;
 +	}
-+	if (hk_engine_write((void *)h->addr, h->saved, HK_INLINE_PATCH_LEN)) {
++	if (hk_engine_write((void *)h->addr, h->saved, h->window)) {
 +		mutex_unlock(&g_inline_lock);
 +		return -EIO;
 +	}
