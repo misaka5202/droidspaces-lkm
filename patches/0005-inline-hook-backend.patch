@@ -3159,7 +3159,7 @@ index 0000000..ff41989
 +#endif
 diff --git a/glue/hk/hk_patch.c b/glue/hk/hk_patch.c
 new file mode 100644
-index 0000000..eecc479
+index 0000000..171b153
 --- /dev/null
 +++ b/glue/hk/hk_patch.c
 @@ -0,0 +1,1411 @@
@@ -4154,11 +4154,11 @@ index 0000000..eecc479
 +		size_t chunk = min(len, PAGE_SIZE - off);
 +		int level = HK_WALK_PTE;
 +		pte_t *ptep;
++		pte_t old;
++		bool was_ro;
 +
 +		ptep = w->pte_of ? w->pte_of(mm, addr, &level) :
 +				   hk_va_pte(mm, addr, &level);
-+		pte_t old;
-+		bool was_ro;
 +
 +		if (!ptep) {
 +			ret = level == HK_WALK_PTE ? -ENOENT : -EOPNOTSUPP;
