@@ -259,6 +259,27 @@ Note that `/proc/<pid>/ns/user` answers a name lookup, not a directory
 listing: `ls /proc/self/ns/` will not show it, but `stat`/`access` succeed.
 That is what Droidspaces actually probes.
 
+## Security notes
+
+These modules add kernel capability, so the ways they can go wrong are worth
+stating.
+
+- `mount_capable` is corrected only for filesystems carrying `FS_USERNS_MOUNT`.
+  Filesystems the kernel deliberately keeps out of user namespaces still require
+  global `CAP_SYS_ADMIN`, so a container root cannot mount them.
+- The cgroup limit modules hold a reference on every cgroup they track, so a
+  cgroup cannot be freed underneath them. Their `cgroup_rmdir` kprobe only marks
+  an entry for reaping; the teardown runs on a workqueue where `synchronize_rcu()`
+  is legal.
+- `devtmpfs_lkm` rewrites `device_add`/`device_del` in kernel text. Its inline
+  hook engine refuses a window that crosses a function boundary, refuses an
+  instruction it cannot relocate, and clears the BTI guarded attribute only on
+  the pages holding resumption points, restoring it on unload. Device nodes it
+  creates default to `0600` owned by root when the driver sets no mode.
+- Module parameters are all `0444`; nothing is runtime-writable.
+
+See [docs/CHANGELOG.md](docs/CHANGELOG.md) for what each release fixed.
+
 ## Important notes
 
 ### A mismatched vermagic can still load

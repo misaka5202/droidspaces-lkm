@@ -235,6 +235,22 @@ CPU limit 那一项也有一个容易被忽略的前提：Droidspaces 要求
 `ls /proc/self/ns/` 看不到它，但 `stat` / `access` 会成功。这正是
 Droidspaces 实际使用的探测方式。
 
+## 安全说明
+
+这些模块是在给内核补能力，所以它可能出错的地方值得写清楚。
+
+- `mount_capable` 只对带 `FS_USERNS_MOUNT` 的文件系统做补正。内核刻意排除在
+  user namespace 之外的文件系统仍然要求全局 `CAP_SYS_ADMIN`，容器内 root 挂不了。
+- cgroup 限额模块对它跟踪的每个 cgroup 都持引用，cgroup 不会在脚下被释放。
+  `cgroup_rmdir` 探针只做标记，真正的回收在工作队列里做，那里才能
+  `synchronize_rcu()`。
+- `devtmpfs_lkm` 会改写内核文本里的 `device_add`/`device_del`。它的 inline hook
+  引擎拒绝跨函数边界的窗口、拒绝无法重定位的指令，并且只清除恢复点所在页的
+  BTI 守卫属性、卸载时还原。它创建设备节点时，驱动没给 mode 就用 `0600` + root。
+- 模块参数全部是 `0444`，运行期不可写。
+
+每个版本修了什么见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 重要提醒
 
 ### vermagic 不匹配也可能加载成功
