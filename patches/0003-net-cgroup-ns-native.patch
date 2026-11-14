@@ -1,0 +1,113 @@
+diff --git a/glue/vendor_kernel_module.c b/glue/vendor_kernel_module.c
+index 4109ce4..7d1ce5d 100644
+--- a/glue/vendor_kernel_module.c
++++ b/glue/vendor_kernel_module.c
+@@ -20,6 +20,7 @@ void (*vns_proc_free_inum_fn)(unsigned int);
+ struct mnt_namespace *(*vns_copy_mnt_ns_fn)(unsigned long, struct mnt_namespace *, struct user_namespace *, struct fs_struct *);
+ void (*vns_put_mnt_ns_fn)(struct mnt_namespace *);
+ struct net *(*vns_copy_net_ns_fn)(unsigned long, struct user_namespace *, struct net *);
++struct cgroup_namespace *(*vns_copy_cgroup_ns_fn)(unsigned long, struct user_namespace *, struct cgroup_namespace *);
+ void (*vns_real_free_nsproxy_fn)(struct nsproxy *);
+ struct pid_namespace *(*vns_real_copy_pid_ns_fn)(unsigned long flags,
+ 	struct user_namespace *user_ns, struct pid_namespace *old_ns);
+@@ -194,6 +195,7 @@ static void vns_resolve_symbols(void)
+ 	vns_copy_mnt_ns_fn = (void *)shadow_hook_resolve("copy_mnt_ns");
+ 	vns_put_mnt_ns_fn = (void *)shadow_hook_resolve("put_mnt_ns");
+ 	vns_copy_net_ns_fn = (void *)shadow_hook_resolve("copy_net_ns");
++	vns_copy_cgroup_ns_fn = (void *)shadow_hook_resolve("copy_cgroup_ns");
+ 	vns_real_free_nsproxy_fn = (void *)shadow_hook_resolve("free_nsproxy");
+ 	vns_real_copy_pid_ns_fn = (void *)shadow_hook_resolve("copy_pid_ns");
+ 	vns_real_put_pid_ns_fn = (void *)shadow_hook_resolve("put_pid_ns");
+diff --git a/vendor/kernel/cgroup/namespace.c b/vendor/kernel/cgroup/namespace.c
+index 5d5d706..aedaa22 100644
+--- a/vendor/kernel/cgroup/namespace.c
++++ b/vendor/kernel/cgroup/namespace.c
+@@ -29,12 +29,38 @@
+ /* NS_COMMON_INIT must bind the static singleton to the vendored ops. */
+ #define cgroupns_operations vns_cgroupns_operations
+ 
++/*
++ * [CGROUP-NS] 原生支持时走真实 copy_cgroup_ns()。
++ *
++ * 真实实现在 kernel/cgroup/namespace.c，不受单独 Kconfig 保护
++ * （CONFIG_CGROUPS=y 即编译），所以 vns_copy_cgroup_ns_fn 解析得到就说明
++ * 内核原生具备 cgroup namespace 能力。实测本设备：不加载本模块时
++ * unshare -C 能建出新 cgroup ns（cgroup:[4026531835] → cgroup:[4026537036]），
++ * 加载后反而恒返回 old_ns —— 原实现直接 (void)flags 忽略参数。
++ *
++ * 与 NET_NS 同理，这里传真实 init_user_ns 而不是 vendored user_ns：
++ * 真实 copy_cgroup_ns 在 CLONE_NEWCGROUP 路径上第一步就
++ * inc_cgroup_namespaces(user_ns) -> inc_ucount()，会沿途走 ns->ucounts
++ * 链并操作全局 ucounts_hashtable；vendored ns 的 ucount 记账与真实内核
++ * 不一致。CONFIG_USER_NS=n 的内核自己在这里用的就是 &init_user_ns。
++ */
+ struct cgroup_namespace *vns_copy_cgroup_ns(unsigned long flags,
+ 					struct user_namespace *user_ns,
+ 					struct cgroup_namespace *old_ns) /* [RENAME] */
+ {
+-	(void)flags;
+ 	(void)user_ns;
++
++	if (vns_copy_cgroup_ns_fn) {
++		struct cgroup_namespace *ns;
++
++		ns = vns_copy_cgroup_ns_fn(flags, vns_real_init_user_ns, old_ns);
++		if (!IS_ERR(ns))
++			return ns;
++		/* 原生路径拒绝时退回共享旧 ns，保持与旧行为一致 */
++		get_cgroup_ns(old_ns); /* [BUILD-COMPAT] */
++		return old_ns;
++	}
++
+ 	get_cgroup_ns(old_ns); /* [BUILD-COMPAT] */
+ 	return old_ns;
+ }
+diff --git a/vendor/kernel/nsproxy.c b/vendor/kernel/nsproxy.c
+index 02d8049..1b37335 100644
+--- a/vendor/kernel/nsproxy.c
++++ b/vendor/kernel/nsproxy.c
+@@ -412,7 +412,31 @@ static __nocfi struct nsproxy *create_new_namespaces(unsigned long flags,
+ 	 * MNT_NS in vendor/README.md.
+ 	 */
+ 	if (vns_copy_net_ns_fn) {
+-		new_nsp->net_ns = vns_copy_net_ns_fn(flags & ~CLONE_NEWNET, user_ns,
++		/*
++		 * [NET-NS] 不再屏蔽 CLONE_NEWNET。
++		 *
++		 * vns_copy_net_ns_fn 解析得到，说明目标内核 CONFIG_NET_NS=y
++		 * —— copy_net_ns/net_alloc/setup_net 整段都在
++		 * net/core/net_namespace.c 的 #ifdef CONFIG_NET_NS 里，符号
++		 * 存在即原生可用。实测本设备：不加载本模块时 unshare -n 能
++		 * 建出真实 netns（net:[4026531840] → net:[4026537042]，内部
++		 * 只剩 lo）；加载后反而失效，--net=macvlan 容器因此报
++		 * "could not create eth0"。
++		 *
++		 * 原实现剥 flag 的理由（见上方长注释）是真实 copy_net_ns
++		 * 曾触发 percpu_counters 链表损坏。那个损坏最可能的来源是把
++		 * vendored user_namespace 传了进去：copy_net_ns 第一步就
++		 * inc_net_namespaces(user_ns) -> inc_ucount()，它沿
++		 * ns->ucounts 链走并操作全局 ucounts_hashtable，而 vendored
++		 * ns 的 ucount 记账与真实内核并不一致（本机 dmesg 里
++		 * dec_rlimit_ucounts 下溢警告是同一错配的症状）。
++		 *
++		 * 这里改传真实 init_user_ns —— 这正是 CONFIG_USER_NS=n 的
++		 * 内核自己做同一件事时用的值（current_user_ns() 该配置分支
++		 * 恒返回 &init_user_ns），从而把 vendored ns 完全排除在真实
++		 * ucount 代码之外。
++		 */
++		new_nsp->net_ns = vns_copy_net_ns_fn(flags, vns_real_init_user_ns,
+ 						      tsk->nsproxy->net_ns);
+ 		if (IS_ERR(new_nsp->net_ns)) {
+ 			err = PTR_ERR(new_nsp->net_ns);
+diff --git a/vendor/vendor_kernel.h b/vendor/vendor_kernel.h
+index 6d5e282..e94d60d 100644
+--- a/vendor/vendor_kernel.h
++++ b/vendor/vendor_kernel.h
+@@ -135,6 +135,7 @@ int vns_procfs_compat_detach_init_pidns_ops(void);
+ extern struct mnt_namespace *(*vns_copy_mnt_ns_fn)(unsigned long, struct mnt_namespace *, struct user_namespace *, struct fs_struct *);
+ extern void (*vns_put_mnt_ns_fn)(struct mnt_namespace *);
+ extern struct net *(*vns_copy_net_ns_fn)(unsigned long, struct user_namespace *, struct net *);
++extern struct cgroup_namespace *(*vns_copy_cgroup_ns_fn)(unsigned long, struct user_namespace *, struct cgroup_namespace *);
+ /*
+  * [BUILD-COMPAT] Real kernel's own (non-exported, non-static) free_nsproxy(),
+  * resolved by name so a *foreign* (non-module-owned) struct nsproxy * whose
