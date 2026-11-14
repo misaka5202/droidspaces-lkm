@@ -24,6 +24,19 @@
 #include "hk_inline.h"
 
 #define HK_TRAMP_SIZE 4096
+
+/*
+ * [安全] tramp 暂存区的容量必须能装下最坏情况：
+ *   6 字头（bti + ldr/ret + wrapper 地址 + bti）
+ * + HK_INLINE_ENTRY_MAX 条，每条最多 8 字（hk_relo_len 的最大值）
+ * + 6 字收尾 stub
+ * 现在 ENTRY_MAX=5 时是 52 字，与 256 字节（64 字）刚好有空余；一旦把
+ * 窗口调大或新增更长的指令类，下面这条断言会在编译期直接失败，而不是
+ * 在运行时把栈/堆写穿。
+ */
+#define HK_TRAMP_STAGE_WORDS 64
+static_assert(6 + HK_INLINE_ENTRY_MAX * 8 + 6 <= HK_TRAMP_STAGE_WORDS,
+	      "tramp staging buffer cannot hold the window plus the stub");
 #define HK_INS_LDR_X17 0x58000051
 #define HK_INS_LDR_X17_P12 0x58000071
 #define HK_INS_B_X12 0x14000003
@@ -259,7 +272,20 @@ static bool hk_in_tramp(const struct hk_relo_ctx *c, u64 addr)
  * instruction in the trampoline after relocation, and the copy sits at the sum
  * of the lengths of everything emitted before it
  */
-static u64 hk_relo_in_tramp(const struct hk_relo_ctx *c, u64 addr)
+/*
+ * [安全] 越界读修复。
+ *
+ * 原实现直接 hk_relo_len[hk_insn_index(inst)]，而 hk_insn_index() 对没能
+ * 归类的指令返回 -1（HK_INST_IGNORE）。-1 索引会读到数组前面，fix 变成
+ * 垃圾值，trampoline 里的目标地址随之算错，最终写坏内核文本。
+ *
+ * 之所以会真的取到 -1：操作数可以前向引用窗口里更靠后的指令（adr / ldr
+ * 字面量 / b 往前跳），而那些指令在本次 relocate 时还没被归类验证。
+ *
+ * 现在遇到未归类指令就让 *ok = false，由调用方放弃这次 hook（返回
+ * -EOPNOTSUPP），绝不用垃圾地址去写文本。
+ */
+static u64 hk_relo_in_tramp(const struct hk_relo_ctx *c, u64 addr, bool *ok)
 {
 	const u8 *src = c->src ? c->src : (const u8 *)c->tramp_start;
 	u64 fix = c->backup_start;
@@ -267,14 +293,22 @@ static u64 hk_relo_in_tramp(const struct hk_relo_ctx *c, u64 addr)
 	u32 inst;
 	u32 j;
 
+	*ok = true;
 	if (!hk_in_tramp(c, addr))
 		return addr;
 	idx = (addr - c->tramp_start) / 4;
 	if (idx >= HK_INLINE_ENTRY_MAX)
 		return addr;
 	for (j = 0; j < idx; j++) {
+		int k;
+
 		inst = hk_get_insn(src + j * 4);
-		fix += hk_relo_len[hk_insn_index(inst)] * 4;
+		k = hk_insn_index(inst);
+		if (k < 0) {
+			*ok = false;
+			return addr;
+		}
+		fix += hk_relo_len[k] * 4;
 	}
 	return fix;
 }
@@ -310,6 +344,7 @@ static __nocfi int hk_relo_abs_jump(struct hk_relo_ctx *c, u64 target)
 static __nocfi int hk_relo_b(struct hk_relo_ctx *c, u32 insn,
 			     hk_inst_type_t type)
 {
+	bool relo_ok;
 	u64 disp;
 	u64 addr;
 
@@ -318,7 +353,9 @@ static __nocfi int hk_relo_b(struct hk_relo_ctx *c, u32 insn,
 	else
 		disp = hk_sext(insn & 0x03FFFFFF, 26) << 2;
 	addr = c->inst_addr + disp;
-	addr = hk_relo_in_tramp(c, addr);
+	addr = hk_relo_in_tramp(c, addr, &relo_ok);
+	if (!relo_ok)
+		return -EOPNOTSUPP;
 
 	/*
 	 * a conditional branch has to keep its own two instruction test and land
@@ -343,9 +380,12 @@ static __nocfi long hk_adr_imm(u32 insn)
 
 static __nocfi int hk_relo_bl(struct hk_relo_ctx *c, u32 insn)
 {
+	bool relo_ok;
 	u64 addr = c->inst_addr + hk_sext(insn & 0x03FFFFFF, 26) * 4;
 
-	addr = hk_relo_in_tramp(c, addr);
+	addr = hk_relo_in_tramp(c, addr, &relo_ok);
+	if (!relo_ok)
+		return -EOPNOTSUPP;
 	/*
 	 * the call returns to the word after blr, so a branch has to sit there and
 	 * carry it over the literal, or the return lands inside it
@@ -387,12 +427,15 @@ static __nocfi int hk_relo_adr(struct hk_relo_ctx *c, u32 insn,
 static __nocfi int hk_relo_ldr(struct hk_relo_ctx *c, u32 insn,
 			       hk_inst_type_t type)
 {
+	bool relo_ok;
 	u32 rt = insn & 0x1F;
 	u64 addr = c->inst_addr + hk_sext((insn >> 5) & 0x7FFFF, 19) * 4;
 
 	if (hk_in_tramp(c, addr) && type != HK_INST_PRFM)
 		return -EOPNOTSUPP;
-	addr = hk_relo_in_tramp(c, addr);
+	addr = hk_relo_in_tramp(c, addr, &relo_ok);
+	if (!relo_ok)
+		return -EOPNOTSUPP;
 
 	if (type == HK_INST_LDR_32 || type == HK_INST_LDR_64 ||
 	    type == HK_INST_LDRSW) {
@@ -438,9 +481,12 @@ static __nocfi int hk_relo_ldr(struct hk_relo_ctx *c, u32 insn,
 
 static __nocfi int hk_relo_cb(struct hk_relo_ctx *c, u32 insn)
 {
+	bool relo_ok;
 	u64 addr = c->inst_addr + hk_sext((insn >> 5) & 0x7FFFF, 19) * 4;
 
-	addr = hk_relo_in_tramp(c, addr);
+	addr = hk_relo_in_tramp(c, addr, &relo_ok);
+	if (!relo_ok)
+		return -EOPNOTSUPP;
 	c->dst[c->count++] = (insn & 0xFF00001F) | 0x40;
 	c->dst[c->count++] = 0x14000006;
 	return hk_relo_stub(c, addr, true);
@@ -448,9 +494,12 @@ static __nocfi int hk_relo_cb(struct hk_relo_ctx *c, u32 insn)
 
 static __nocfi int hk_relo_tb(struct hk_relo_ctx *c, u32 insn)
 {
+	bool relo_ok;
 	u64 addr = c->inst_addr + hk_sext((insn >> 5) & 0x3FFF, 14) * 4;
 
-	addr = hk_relo_in_tramp(c, addr);
+	addr = hk_relo_in_tramp(c, addr, &relo_ok);
+	if (!relo_ok)
+		return -EOPNOTSUPP;
 	c->dst[c->count++] = (insn & 0xFFF8001F) | 0x40;
 	c->dst[c->count++] = 0x14000006;
 	return hk_relo_stub(c, addr, true);
@@ -857,7 +906,7 @@ static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
 	int ret;
 
 	memset(h, 0, sizeof(*h));
-	tramp = kzalloc(256, GFP_KERNEL);
+	tramp = kzalloc(HK_TRAMP_STAGE_WORDS * 4, GFP_KERNEL);
 	if (!tramp)
 		return -ENOMEM;
 
