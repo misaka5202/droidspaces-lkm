@@ -69,10 +69,57 @@ struct cpu_priv {
 	atomic64_t window_start;/* ktime_to_us */
 	atomic64_t window_usage_base; /* 窗口起点累计 usage（us） */
 	atomic64_t frozen;	/* 0/1：当前是否被冻结 */
+	atomic_t dead;		/* 1=cgroup 已 rmdir，等待 tick 回收 */
 };
 
 static DEFINE_XARRAY(cpu_xa);
 
+/*
+ * [安全] 条目生命周期。
+ *
+ * 原来的做法是 xarray 里存裸 struct cgroup *，销毁靠 cgroup_rmdir kprobe
+ * 里直接 xa_erase + kfree。这有三个真实缺陷：
+ *
+ *   1. cgroup 被释放后指针悬垂；copy_from_kernel_nofault 只能挡未映射内存，
+ *      挡不住"内存被 slab 复用后读到垃圾但非 NULL"，于是仍会把野指针当
+ *      struct cgroup 用 —— 这正是之前 css_task_iter_advance_css_set 空指针
+ *      panic 的来源。
+ *   2. kprobe 上下文里 xa_erase/kfree，与 tick 遍历并发 → 释放后使用。
+ *   3. cpu_find() 返回 p 后没有任何引用计数，tick 里 kfree 与读写方竞争。
+ *
+ * 现在的做法：
+ *   - 建条目时用 percpu_ref_get(&cgrp->self.refcnt) 抓住 cgroup
+ *     （等价于内核自己的 cgroup_get()）。cgroup 内存因此在整个条目存活
+ *     期间都有效，野指针问题从根上消失。
+ *   - 读方用 rcu_read_lock()，释放方先 xa_erase 再 synchronize_rcu()
+ *     再 kfree，保证没有读方还握着 p。
+ *   - kprobe 只置 dead 标记（不睡眠、不释放），真正回收放到 tick 工作队列。
+ *   - 所有增删 cpu_priv 的地方都持 cpu_lock。
+ */
+static DEFINE_MUTEX(cpu_lock);
+
+/* 等价于内核 cgroup_get()：cgroup_get() 是 static inline，模块里拿不到符号 */
+static void ctl_cgroup_get(struct cgroup *cgrp)
+{
+	if (!(READ_ONCE(cgrp->self.flags) & CSS_NO_REF))
+		percpu_ref_get(&cgrp->self.refcnt);
+}
+
+static void ctl_cgroup_put(struct cgroup *cgrp)
+{
+	if (!(READ_ONCE(cgrp->self.flags) & CSS_NO_REF))
+		percpu_ref_put(&cgrp->self.refcnt);
+}
+
+/* 调用前索引已被摘除；必须在可睡眠上下文调用（synchronize_rcu 会睡） */
+static void cpu_free_entry(unsigned long idx, struct cpu_priv *p)
+{
+	ctl_cgroup_put((struct cgroup *)idx);
+	synchronize_rcu();
+	kfree(p);
+}
+
+/* 读方用：进入 RCU 临界区后才能安全解引用返回的 p */
 static struct cpu_priv *cpu_find(struct cgroup *cgrp)
 {
 	return xa_load(&cpu_xa, (unsigned long)cgrp);
@@ -84,9 +131,15 @@ static u64 cpu_max_read_u64(struct cgroup_subsys_state *css,
 			    struct cftype *cft)
 {
 	struct cgroup *cgrp = css->cgroup;
-	struct cpu_priv *p = cpu_find(cgrp);
+	struct cpu_priv *p;
+	u64 v = 0;
 
-	return p ? (u64)atomic64_read(&p->quota_us) : 0;
+	rcu_read_lock();
+	p = cpu_find(cgrp);
+	if (p)
+		v = (u64)atomic64_read(&p->quota_us);
+	rcu_read_unlock();
+	return v;
 }
 
 static ssize_t cpu_max_write(struct kernfs_open_file *of, char *buf,
@@ -129,26 +182,46 @@ static ssize_t cpu_max_write(struct kernfs_open_file *of, char *buf,
 			quota = 0;
 	}
 
+	/*
+	 * 整段持 cpu_lock：建条目要取 cgroup 引用，且建/改必须和 tick 的
+	 * 回收串行。写 cpu.max 是低频操作，锁竞争可以忽略。
+	 */
+	mutex_lock(&cpu_lock);
 	p = cpu_find(cgrp);
 	if (!p) {
 		p = kzalloc(sizeof(*p), GFP_KERNEL);
-		if (!p)
+		if (!p) {
+			mutex_unlock(&cpu_lock);
 			return -ENOMEM;
+		}
 		atomic64_set(&p->quota_us, 0);
 		atomic64_set(&p->period_us, 100000);
 		atomic64_set(&p->used_us, 0);
 		atomic64_set(&p->window_start, 0);
 		atomic64_set(&p->window_usage_base, 0);
 		atomic64_set(&p->frozen, 0);
+		atomic_set(&p->dead, 0);
+		/*
+		 * 先抓住 cgroup：条目存活期间它就不会被释放，tick 里拿到的
+		 * struct cgroup * 因此永远有效。写 cftype 时调用方持有该
+		 * cgroup 的活动引用，此刻取引用是安全的。
+		 */
+		ctl_cgroup_get(cgrp);
 		{
 			struct cpu_priv *old =
 				xa_store(&cpu_xa, (unsigned long)cgrp, p,
 					 GFP_KERNEL);
 			if (xa_is_err(old)) {
+				int err = xa_err(old);
+
+				ctl_cgroup_put(cgrp);
 				kfree(p);
-				return xa_err(old);
+				mutex_unlock(&cpu_lock);
+				return err;
 			}
 			if (old) {
+				/* 别人抢先建了：放掉我们多取的那一份 */
+				ctl_cgroup_put(cgrp);
 				kfree(p);
 				p = old;
 			}
@@ -160,6 +233,8 @@ static ssize_t cpu_max_write(struct kernfs_open_file *of, char *buf,
 	atomic64_set(&p->window_start, ktime_to_us(ktime_get()));
 	atomic64_set(&p->window_usage_base, 0);
 	atomic64_set(&p->frozen, 0);
+	atomic_set(&p->dead, 0);
+	mutex_unlock(&cpu_lock);
 	cpu_info("cpu.max=%lld/%lld on cgroup %px\n",
 		 (long long)quota, (long long)period, cgrp);
 	return (ssize_t)nbytes;
@@ -168,9 +243,16 @@ static ssize_t cpu_max_write(struct kernfs_open_file *of, char *buf,
 static int cpu_max_show(struct seq_file *sf, void *v)
 {
 	struct cgroup_subsys_state *css = seq_css(sf);
-	struct cpu_priv *p = cpu_find(css->cgroup);
-	u64 quota = p ? atomic64_read(&p->quota_us) : 0;
-	u64 period = p ? atomic64_read(&p->period_us) : 100000;
+	struct cpu_priv *p;
+	u64 quota = 0, period = 100000;
+
+	rcu_read_lock();
+	p = cpu_find(css->cgroup);
+	if (p) {
+		quota = atomic64_read(&p->quota_us);
+		period = atomic64_read(&p->period_us);
+	}
+	rcu_read_unlock();
 
 	if (quota == S64_MAX)
 		seq_puts(sf, "max\n");
@@ -500,20 +582,23 @@ static void __nocfi cpu_tick(struct work_struct *w)
 		if (quota <= 0 || quota == S64_MAX)
 			continue;
 
-		/* 已释放的 cgroup：清掉条目，绝不再解引用。
-		 * 不加这一步会在 css_task_iter_advance_css_set 里
-		 * 空指针解引用 panic（已实测）。 */
-		if (!ctl_cgrp_alive(cgrp)) {
-			if (cpu_debug) {
-				static unsigned long last_dead;
-				if (time_after(jiffies, last_dead + 3 * HZ)) {
-					last_dead = jiffies;
-					pr_info("[droid_lkm_cpu] drop dead cgrp=%px\n",
-						cgrp);
-				}
+		/* 已 rmdir（kprobe 置位）或已不可用：摘条目并回收。
+		 * 这里在 workqueue 上下文，可以 synchronize_rcu()。 */
+		if (atomic_read(&p->dead) || !ctl_cgrp_alive(cgrp)) {
+			bool removed = false;
+
+			mutex_lock(&cpu_lock);
+			if (xa_load(&cpu_xa, idx) == p) {
+				xa_erase(&cpu_xa, idx);
+				removed = true;
 			}
-			xa_erase(&cpu_xa, idx);
-			kfree(p);
+			mutex_unlock(&cpu_lock);
+			if (cpu_debug)
+				pr_info("[droid_lkm_cpu] drop cgrp=%px removed=%d\n",
+					cgrp, (int)removed);
+			/* 索引被别人摘走时，那份引用由摘除方负责释放 */
+			if (removed)
+				cpu_free_entry(idx, p);
 			continue;
 		}
 
@@ -617,13 +702,21 @@ static int __nocfi ctl_rmdir_pre(struct kprobe *p, struct pt_regs *regs)
 	if (!ctl_read_ptr((unsigned long)kn + ctl_kn_priv_off, &v))
 		return 0;
 
+	/*
+	 * [安全] kprobe 上下文里不能做 xa_erase/kfree：
+	 *   - 会与 tick 遍历并发，造成释放后使用；
+	 *   - kfree 之后 tick 里那只指针就野了。
+	 * 这里只置 dead 标记（原子操作、不睡眠），真正回收交给 tick
+	 * 工作队列，那里可以安全地摘条目、drop 引用并 synchronize_rcu。
+	 */
+	rcu_read_lock();
 	cp = xa_load(&cpu_xa, v);
 	if (cp) {
-		xa_erase(&cpu_xa, v);
-		kfree(cp);
+		atomic_set(&cp->dead, 1);
 		if (cpu_debug)
-			pr_info("[droid_lkm_cpu] rmdir cgrp=%lx erased\n", v);
+			pr_info("[droid_lkm_cpu] rmdir cgrp=%lx marked dead\n", v);
 	}
+	rcu_read_unlock();
 	return 0;
 }
 
@@ -771,8 +864,19 @@ static void __exit droid_lkm_cpu_exit(void)
 	if (cpu_files_live)
 		cgroup_rm_cftypes(cpu_max_files);
 
-	xa_for_each(&cpu_xa, idx, p)
-		kfree(p);
+	/* 逐个摘除并释放：必须先 drop 我们持有的 cgroup 引用，
+	 * 否则对应 cgroup 永远回收不了（内存泄漏）。 */
+	{
+		struct cpu_priv *victim;
+
+		xa_for_each(&cpu_xa, idx, p) {
+			mutex_lock(&cpu_lock);
+			victim = xa_erase(&cpu_xa, idx);
+			mutex_unlock(&cpu_lock);
+			if (victim)
+				cpu_free_entry(idx, victim);
+		}
+	}
 	xa_destroy(&cpu_xa);
 	cpu_info("unloaded\n");
 }

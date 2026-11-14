@@ -53,10 +53,46 @@
 struct pids_priv {
 	atomic64_t counter;	/* 本 cgroup + 所有后代（层级累加） */
 	atomic64_t limit;	/* 0=未启用; S64_MAX="max" 无限 */
+	atomic_t dead;		/* 1=cgroup 已 rmdir，等待回收 */
 };
 
 static DEFINE_XARRAY(pids_xa);
 
+/*
+ * [安全] 条目生命周期（与 cpu 模块同样的三处缺陷）。
+ *
+ * 原实现：xarray 存裸 struct cgroup *，cgroup_rmdir kprobe 里直接
+ * xa_erase，而且**没有 kfree** —— 每条 pids_priv 永久泄漏。更麻烦的是
+ * cgroup 释放后指针可能被新 cgroup 复用，新容器就会意外继承上一个容器
+ * 的 pids 限制。
+ *
+ * 现在：建条目时用 percpu_ref_get(&cgrp->self.refcnt) 抓住 cgroup（等价
+ * 内核 cgroup_get()），条目存活期间该地址不会被复用；kprobe 只置 dead，
+ * 由 reaper 工作队列摘条目、drop 引用并按 RCU 安全释放。
+ */
+static DEFINE_MUTEX(pids_lock);
+
+static void pids_cgroup_get(struct cgroup *cgrp)
+{
+	if (!(READ_ONCE(cgrp->self.flags) & CSS_NO_REF))
+		percpu_ref_get(&cgrp->self.refcnt);
+}
+
+static void pids_cgroup_put(struct cgroup *cgrp)
+{
+	if (!(READ_ONCE(cgrp->self.flags) & CSS_NO_REF))
+		percpu_ref_put(&cgrp->self.refcnt);
+}
+
+/* 索引已摘除；可睡眠上下文调用 */
+static void pids_free_entry(unsigned long idx, struct pids_priv *p)
+{
+	pids_cgroup_put((struct cgroup *)idx);
+	synchronize_rcu();
+	kfree(p);
+}
+
+/* 读方进入 rcu_read_lock() 后可安全解引用 */
 static struct pids_priv *pids_find(struct cgroup *cgrp)
 {
 	return xa_load(&pids_xa, (unsigned long)cgrp);
@@ -434,8 +470,57 @@ static int ctl_rmdir_pre(struct kprobe *p, struct pt_regs *regs)
 	if (!ctl_read_ptr((unsigned long)kn + ctl_kn_priv_off, &v))
 		return 0;
 
-	xa_erase(&pids_xa, v);
+	/*
+	 * [安全] 只置标记。kprobe 上下文里不能 xa_erase/kfree：
+	 * erase 会让并发读方拿到的 p 立刻失效，而原实现连 kfree 都没有，
+	 * 每条记录直接泄漏。真正的摘除/释放交给 pids_reap_work。
+	 */
+	rcu_read_lock();
+	{
+		struct pids_priv *cp = xa_load(&pids_xa, v);
+
+		if (cp)
+			atomic_set(&cp->dead, 1);
+	}
+	rcu_read_unlock();
 	return 0;
+}
+
+/* ------------------------------------------------ dead 条目回收队列 --- */
+
+/*
+ * cgroup_rmdir 探针只置 dead 标记；这里周期性把标记过的条目摘掉，
+ * drop cgroup 引用并按 RCU 安全释放。用工作队列而不是在 kprobe 里做，
+ * 是因为 synchronize_rcu() 会睡眠。
+ */
+static struct delayed_work pids_reap_work;
+static bool pids_reap_live;
+#define PIDS_REAP_MS 1000
+
+static void pids_reap_fn(struct work_struct *w)
+{
+	struct pids_priv *p;
+	unsigned long idx;
+
+	xa_for_each(&pids_xa, idx, p) {
+		struct pids_priv *victim;
+
+		if (!atomic_read(&p->dead))
+			continue;
+		mutex_lock(&pids_lock);
+		victim = xa_erase(&pids_xa, idx);
+		mutex_unlock(&pids_lock);
+		if (victim)
+			pids_free_entry(idx, victim);
+	}
+	schedule_delayed_work(&pids_reap_work, msecs_to_jiffies(PIDS_REAP_MS));
+}
+
+static void pids_start_reaper(void)
+{
+	INIT_DELAYED_WORK(&pids_reap_work, pids_reap_fn);
+	pids_reap_live = true;
+	schedule_delayed_work(&pids_reap_work, msecs_to_jiffies(PIDS_REAP_MS));
 }
 
 /* ------------------------------------------------------- B1 文件层 --- */
@@ -444,9 +529,15 @@ static u64 pids_max_read_u64(struct cgroup_subsys_state *css,
 			     struct cftype *cft)
 {
 	struct cgroup *cgrp = css->cgroup;
-	struct pids_priv *p = pids_find(cgrp);
+	struct pids_priv *p;
+	u64 v = 0;
 
-	return p ? (u64)atomic64_read(&p->limit) : 0;
+	rcu_read_lock();
+	p = pids_find(cgrp);
+	if (p)
+		v = (u64)atomic64_read(&p->limit);
+	rcu_read_unlock();
+	return v;
 }
 
 static ssize_t pids_max_write(struct kernfs_open_file *of, char *buf,
@@ -481,27 +572,41 @@ static ssize_t pids_max_write(struct kernfs_open_file *of, char *buf,
 			val = 0;
 	}
 
+	mutex_lock(&pids_lock);
 	p = pids_find(cgrp);
 	if (!p) {
 		p = kzalloc(sizeof(*p), GFP_KERNEL);
-		if (!p)
+		if (!p) {
+			mutex_unlock(&pids_lock);
 			return -ENOMEM;
+		}
 		atomic64_set(&p->limit, 0);
+		atomic_set(&p->dead, 0);
+		/* 抓住 cgroup：条目存活期间地址不会被复用，避免新容器
+		 * 继承上个容器的限制 */
+		pids_cgroup_get(cgrp);
 		{
 			struct pids_priv *old =
 				xa_store(&pids_xa, (unsigned long)cgrp, p,
 					 GFP_KERNEL);
 			if (xa_is_err(old)) {
+				int err = xa_err(old);
+
+				pids_cgroup_put(cgrp);
 				kfree(p);
-				return xa_err(old);
+				mutex_unlock(&pids_lock);
+				return err;
 			}
 			if (old) {
+				pids_cgroup_put(cgrp);
 				kfree(p);
 				p = old;
 			}
 		}
 	}
 	atomic64_set(&p->limit, val);
+	atomic_set(&p->dead, 0);
+	mutex_unlock(&pids_lock);
 	return (ssize_t)nbytes;
 }
 
@@ -509,9 +614,15 @@ static u64 pids_current_read_u64(struct cgroup_subsys_state *css,
 				 struct cftype *cft)
 {
 	struct cgroup *cgrp = css->cgroup;
-	struct pids_priv *p = pids_find(cgrp);
+	struct pids_priv *p;
+	u64 v = 0;
 
-	return p ? (u64)atomic64_read(&p->counter) : 0;
+	rcu_read_lock();
+	p = pids_find(cgrp);
+	if (p)
+		v = (u64)atomic64_read(&p->counter);
+	rcu_read_unlock();
+	return v;
 }
 
 static int pids_stats_show(struct seq_file *sf, void *v)
@@ -658,6 +769,9 @@ static int __init droid_lkm_pids_init(void)
 
 	ctl_layout_init();
 
+	/* dead 条目的回收队列（cgroup_rmdir 探针只置标记） */
+	pids_start_reaper();
+
 	/* B3：subtree_control 翻译，最先装 */
 	ctl_probe_one(&ctl_subtree_probe, "cgroup_subtree_control_write",
 		      ctl_subtree_pre, &ctl_live_subtree);
@@ -729,6 +843,10 @@ static void __exit droid_lkm_pids_exit(void)
 	struct pids_priv *p;
 	unsigned long idx;
 
+	if (pids_reap_live) {
+		cancel_delayed_work_sync(&pids_reap_work);
+		pids_reap_live = false;
+	}
 	if (ctl_live_display) {
 		unregister_kretprobe(&ctl_ctrl_show_krp);
 		unregister_kretprobe(&ctl_cgroupstats_krp);
@@ -741,8 +859,18 @@ static void __exit droid_lkm_pids_exit(void)
 	ctl_unprobe(&ctl_can_fork_probe, ctl_live_can_fork);
 	ctl_unprobe(&ctl_subtree_probe, ctl_live_subtree);
 
-	xa_for_each(&pids_xa, idx, p)
-		kfree(p);
+	/* 逐个摘除并释放：必须 drop 持有的 cgroup 引用 */
+	{
+		struct pids_priv *victim;
+
+		xa_for_each(&pids_xa, idx, p) {
+			mutex_lock(&pids_lock);
+			victim = xa_erase(&pids_xa, idx);
+			mutex_unlock(&pids_lock);
+			if (victim)
+				pids_free_entry(idx, victim);
+		}
+	}
 	xa_destroy(&pids_xa);
 	pids_info("unloaded\n");
 }
