@@ -244,6 +244,9 @@ Droidspaces 实际使用的探测方式。
 - cgroup 限额模块对它跟踪的每个 cgroup 都持引用，cgroup 不会在脚下被释放。
   `cgroup_rmdir` 探针只做标记，真正的回收在工作队列里做，那里才能
   `synchronize_rcu()`。
+- `lkm4ctr` 靠改写函数入口的 inline 跳转来重定向，不再用 kprobe 陷阱。
+  被覆盖的指令搬到目标附近的 trampoline 里执行，所以 4 字节 `b` 就够；
+  kprobe 只在近址分配失败时兜底。
 - `devtmpfs_lkm` 会改写内核文本里的 `device_add`/`device_del`。它的 inline hook
   引擎拒绝跨函数边界的窗口、拒绝无法重定位的指令，并且只清除恢复点所在页的
   BTI 守卫属性、卸载时还原。它创建设备节点时，驱动没给 mode 就用 `0600` + root。

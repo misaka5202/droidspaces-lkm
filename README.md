@@ -271,6 +271,10 @@ stating.
   cgroup cannot be freed underneath them. Their `cgroup_rmdir` kprobe only marks
   an entry for reaping; the teardown runs on a workqueue where `synchronize_rcu()`
   is legal.
+- `lkm4ctr` redirects kernel functions by rewriting their entry with an
+  inline jump, not a kprobe trap. The displaced instructions run from a
+  trampoline placed next to the target so a 4-byte `b` reaches it; the
+  kprobe path remains only as a fallback when that allocation fails.
 - `devtmpfs_lkm` rewrites `device_add`/`device_del` in kernel text. Its inline
   hook engine refuses a window that crosses a function boundary, refuses an
   instruction it cannot relocate, and clears the BTI guarded attribute only on

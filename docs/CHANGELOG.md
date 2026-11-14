@@ -1,5 +1,73 @@
 # Changelog
 
+## v1.0.2
+
+The hook engine no longer runs on kprobe on stock firmware. Same functionality,
+different mechanism, plus one privilege escalation that the v1.0.1 audit
+introduced.
+
+### The hook backend
+
+`shadow_hook` picks its backend at compile time: ftrace when the kernel has
+`CONFIG_FUNCTION_TRACER && CONFIG_DYNAMIC_FTRACE`, otherwise a kprobe
+pre_handler that rewrites the trapped pc. Vendor GKI kernels commonly build
+FUNCTION_TRACER out -- this device reports `# CONFIG_FUNCTION_TRACER is not
+set` -- so kprobe was what actually ran on stock firmware.
+
+kprobe works, but it costs a BRK exception on entry plus a second one from the
+kretprobe the engine installs for in-flight tracking, on every hooked call. The
+hot hooks (fork, clone, clone3, vfork, unshare, setns, copy_namespaces,
+copy_creds, prepare_creds, wake_up_new_task, mount_capable) are all on the
+process-creation path. It also occupies the kprobe slot for that address, which
+KernelSU/SUSFS and vendor modules share.
+
+An inline hook writes a jump over the entry instead: no exception, no handler,
+no shared slot. The displaced instructions are relocated into a trampoline and
+that trampoline becomes `hook->original`, so a replacement calling "original"
+never lands on the patched prologue -- which removes the recursion guard the
+other two backends need.
+
+Two things made this less routine than it sounds:
+
+- **A 20-byte detour cannot patch a syscall wrapper.** The absolute jump is
+  `bti jc ; ldr x17,#8 ; br x17 ; .quad target`. `__arm64_sys_msgget` is a
+  `bti`, two register moves and a tail `b`, so the branch sits at offset 12 and
+  a five-instruction window does not fit. The first attempt let the module
+  install 14 hooks and then fail on this one with `-EOPNOTSUPP`, rolling the
+  whole init back.
+- **A 4-byte `b` cannot reach the general vmalloc area.** With
+  `CONFIG_ARM64_VA_BITS=39` the module region ends at `0xffffffc800000000`
+  while this kernel's KASLR-randomised text sits around `0xffffffde1b7ceac8` --
+  about 95 GB apart, far outside the ±128MB a `b` encodes. That is why the
+  kernel itself ships `CONFIG_ARM64_MODULE_PLTS`.
+
+The engine now allocates the trampoline in the vmalloc gap just below the
+target (`[addr-112MB, addr-4MB]`) and, when that lands, patches the entry with
+a single `b`: 4-byte window, one instruction relocated, no BTI landing pad, no
+literal pool. Every hooked function takes that path, syscall wrappers included.
+If the near allocation fails the old 20-byte detour is used, and if even that
+fails the hook falls back to kprobe -- a tight vmalloc gap degrades instead of
+breaking.
+
+### Privilege escalation fixed
+
+- `mount_capable` is now corrected only for filesystems carrying
+  `FS_USERNS_MOUNT`. v1.0.1 taught it to substitute `ns_capable(current_userns)`
+  whenever the real check failed and `fc->user_ns` was init, but the real
+  function has two arms: a global `capable(CAP_SYS_ADMIN)` for filesystems the
+  kernel deliberately keeps out of user namespaces, and
+  `ns_capable(fc->user_ns)` for the ones it allows. Since `fc->user_ns` is
+  pinned to init under `CONFIG_USER_NS=n`, the old condition could not tell
+  them apart, and a container root could mount ext4 and anything else behind a
+  block device.
+
+### Verified
+
+- All 7 KMIs build.
+- On the device before this change: 578 us/fork with the kprobe backend versus
+  485 us/fork with the module unloaded, min-of-8. The inline figures for this
+  release were not measured -- the handset dropped off USB before the run.
+
 ## v1.0.1
 
 Security audit of the C code. Three findings, all fixed. Nothing here changes
