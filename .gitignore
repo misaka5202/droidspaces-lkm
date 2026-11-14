@@ -11,3 +11,13 @@ Module.symvers
 
 # 保留 prebuilt（WSL 验证过的产物）
 !prebuilt/*.ko
+
+# kernel build artifacts
+*.o
+*.o.d
+*.ko
+*.mod
+*.mod.c
+.*.cmd
+modules.order
+Module.symvers
