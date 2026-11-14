@@ -10,8 +10,13 @@
 
 Droidspaces needs PID/IPC namespaces, devtmpfs, macvlan, IPv6 NAT and a few
 cgroup controllers. Most vendor kernels ship with those compiled out to satisfy
-GKI ABI checks. This project packages them as loadable modules (`.ko`) that you
-`insmod` on a locked-bootloader device.
+GKI ABI checks.
+
+The other way to get them back is to unlock the bootloader, rebuild the kernel
+and flash it. That works, but it costs you: one kernel per device model, the
+stability of the result is your problem, and every system update means starting
+over. The modules avoid all of that. One set covers seven KMIs, matched against
+`uname -r`, so the device model stops mattering.
 
 ## What it fixes
 
