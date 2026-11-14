@@ -5751,150 +5751,20 @@ index 0000000..b10dab9
 +#endif
 +#endif
 diff --git a/glue/shadow_hijack.c b/glue/shadow_hijack.c
-index d44dded..8d5d29f 100644
+index d44dded..54acd0f 100644
 --- a/glue/shadow_hijack.c
 +++ b/glue/shadow_hijack.c
 @@ -88,6 +88,9 @@
  #include <linux/spinlock.h>
  
  #include "shadow_hook.h"
-+/* [INLINE] inline 文本改写后端（替代 kprobe 陷阱） */
++/* [INLINE] inline 文本改写后端（优先），kprobe 仅作短函数兜底 */
 +int shadow_inline_install(struct shadow_hook *hook);
 +void shadow_inline_remove(struct shadow_hook *hook);
  #include "lkm4ctr_log.h"
  
  #define SHADOW_HIJACK_VERSION	"1.0"
-@@ -138,7 +141,7 @@ static bool shadow_hook_quiescing;
-  * every redirect that started before the gate is visible in the in-flight
-  * count, and no non-exempt redirect can start afterward.
-  */
--static bool shadow_hook_redirect_enter(struct shadow_hook *hook)
-+static __maybe_unused bool shadow_hook_redirect_enter(struct shadow_hook *hook)
- {
- 	unsigned long flags;
- 	bool entered = false;
-@@ -480,7 +483,7 @@ unsigned long shadow_hook_resolve(const char *name)
- EXPORT_SYMBOL_GPL(shadow_hook_resolve);
- 
- #if defined(CONFIG_ARM64)
--static void shadow_hook_redirect(struct pt_regs *regs, void *function)
-+static __maybe_unused void shadow_hook_redirect(struct pt_regs *regs, void *function)
- {
- 	regs->pc = (unsigned long)function;
- }
-@@ -491,12 +494,12 @@ static void shadow_hook_redirect(struct pt_regs *regs, void *function)
-  * before its prologue has run). On arm64 the AAPCS64 calling convention
-  * passes this in the link register (x30/regs[30]).
-  */
--static unsigned long shadow_hook_caller_pc(const struct pt_regs *regs)
-+static __maybe_unused unsigned long shadow_hook_caller_pc(const struct pt_regs *regs)
- {
- 	return regs->regs[30];
- }
- #elif defined(CONFIG_X86_64)
--static void shadow_hook_redirect(struct pt_regs *regs, void *function)
-+static __maybe_unused void shadow_hook_redirect(struct pt_regs *regs, void *function)
- {
- 	regs->ip = (unsigned long)function;
- }
-@@ -506,7 +509,7 @@ static void shadow_hook_redirect(struct pt_regs *regs, void *function)
-  * the stack; at the hooked function's very first instruction regs->sp still
-  * points directly at it.
-  */
--static unsigned long shadow_hook_caller_pc(const struct pt_regs *regs)
-+static __maybe_unused unsigned long shadow_hook_caller_pc(const struct pt_regs *regs)
- {
- 	return *(unsigned long *)regs->sp;
- }
-@@ -900,36 +903,6 @@ EXPORT_SYMBOL_GPL(shadow_hook_remove);
- 
- #else /* !(CONFIG_FUNCTION_TRACER && CONFIG_DYNAMIC_FTRACE) */
- 
--typedef int (*shadow_register_kprobe_t)(struct kprobe *);
--typedef void (*shadow_unregister_kprobe_t)(struct kprobe *);
--
--static shadow_register_kprobe_t shadow_register_kprobe_fn;
--static shadow_unregister_kprobe_t shadow_unregister_kprobe_fn;
--
--static bool shadow_hook_kprobe_api_ready(void)
--{
--	if (!shadow_register_kprobe_fn)
--		shadow_register_kprobe_fn = (shadow_register_kprobe_t)
--			shadow_hook_resolve("register_kprobe");
--	if (!shadow_unregister_kprobe_fn)
--		shadow_unregister_kprobe_fn = (shadow_unregister_kprobe_t)
--			shadow_hook_resolve("unregister_kprobe");
--	return shadow_register_kprobe_fn && shadow_unregister_kprobe_fn;
--}
--
--static int __nocfi shadow_hook_register_kprobe(struct kprobe *kp)
--{
--	if (!shadow_hook_kprobe_api_ready())
--		return -ENOENT;
--	return shadow_register_kprobe_fn(kp);
--}
--
--static void __nocfi shadow_hook_unregister_kprobe(struct kprobe *kp)
--{
--	if (shadow_hook_kprobe_api_ready())
--		shadow_unregister_kprobe_fn(kp);
--}
--
- /*
-  * --- kprobe pre_handler backend -----------------------------------------
-  *
-@@ -949,50 +922,6 @@ static void __nocfi shadow_hook_unregister_kprobe(struct kprobe *kp)
-  * fully described by the kprobes documentation's "jump/int3 based
-  * probing" and "pre_handler return value" semantics.
-  */
--static int shadow_hook_pre_handler(struct kprobe *p, struct pt_regs *regs)
--{
--	struct shadow_hook *hook = container_of(p, struct shadow_hook, kp);
--
--	/*
--	 * The kprobe sits at the very first instruction of the hooked
--	 * function, so it also fires again when *our own* replacement
--	 * (hook->function) calls through hook->original -- which is simply
--	 * the same hooked address -- to invoke genuine kernel behaviour.
--	 * Without this check, that pass-through call would be redirected
--	 * straight back into hook->function, recursing until the kernel
--	 * stack overflows.
--	 *
--	 * Mirror the ftrace backend's within_module(parent_ip, hook->owner)
--	 * guard (see shadow_hook_thunk() above) using the caller's return
--	 * address, which is available at function entry (in the link
--	 * register on arm64, or on the stack on x86-64) before any prologue
--	 * instructions have executed. hook->owner is the merged lkm4ctr.ko
--	 * module that owns the replacement function making the pass-through
--	 * call.
--	 * If the call came from that module, return 0 to tell the kprobes
--	 * core the pre_handler has *not* taken over: it will single-step the
--	 * original (untouched) instruction and resume normal execution, i.e.
--	 * genuinely fall through into the target function's real body.
--	 * Otherwise (a fresh, external call) redirect: return 1, which tells
--	 * kprobes we have fully handled the trap ourselves (regs->pc/ip
--	 * already points at hook->function) and the replaced instruction must
--	 * not be single-stepped.
--	 *
--	 * shadow_hook_redirect_enter() serializes the quiesce check,
--	 * try_module_get(), and in-flight accounting. A successful redirect holds
--	 * the module reference until the return probe runs; if entry is rejected,
--	 * fall through to genuine kernel behaviour (return 0) instead of redirecting.
--	 */
--	if (within_module(shadow_hook_caller_pc(regs), hook->owner))
--		return 0;
--
--	if (!shadow_hook_redirect_enter(hook))
--		return 0;
--
--	shadow_hook_redirect(regs, hook->function);
--	return 1;
--}
--
- int shadow_hook_install(struct shadow_hook *hook)
- {
- 	const char * const *name;
-@@ -1016,19 +945,19 @@ int shadow_hook_install(struct shadow_hook *hook)
+@@ -1016,12 +1019,26 @@ int shadow_hook_install(struct shadow_hook *hook)
  	if (!hook->address)
  		return -ENOENT;
  
@@ -5904,35 +5774,40 @@ index d44dded..8d5d29f 100644
  	if (err)
  		return err;
  
--	memset(&hook->kp, 0, sizeof(hook->kp));
--	hook->kp.addr = (kprobe_opcode_t *)hook->address;
--	hook->kp.pre_handler = shadow_hook_pre_handler;
--
--	err = shadow_hook_register_kprobe(&hook->kp);
 +	/*
-+	 * [INLINE] 不再注册 kprobe。shadow_inline_install() 会在入口写上跳转、
-+	 * 把被覆盖的指令搬进 trampoline，并把 hook->original 指向那个 trampoline，
-+	 * 所以这里不能像 kprobe 后端那样把 original 设成 hook->address。
++	 * [INLINE] 先试 inline 文本改写。成功后 hook->original 指向
++	 * trampoline（不是被改写的入口），替换函数调用 original 时执行的是
++	 * 被搬走的原始指令，不会落回补丁点，因此不需要递归保护。
++	 * 函数入口装不下改写窗口时引擎返回 -EOPNOTSUPP，此时回落到 kprobe。
 +	 */
 +	err = shadow_inline_install(hook);
- 	if (err) {
--		pr_debug("shadow_hook: register_kprobe(%s) failed: %d\n",
-+		pr_debug("shadow_hook: inline hook(%s) failed: %d\n",
- 			 hook->resolved_name, err);
- 		if (new_retprobe)
- 			shadow_hook_retprobe_remove(hook);
-@@ -1051,8 +980,7 @@ void shadow_hook_remove(struct shadow_hook *hook)
++	if (!err) {
++		hook->inline_active = true;
++		return 0;
++	}
++	pr_debug("shadow_hook: inline %s unavailable (%d), kprobe fallback\n",
++		 hook->resolved_name, err);
++
++	*((unsigned long *)hook->original) = hook->address;
+ 	memset(&hook->kp, 0, sizeof(hook->kp));
+ 	hook->kp.addr = (kprobe_opcode_t *)hook->address;
+ 	hook->kp.pre_handler = shadow_hook_pre_handler;
+@@ -1051,7 +1068,12 @@ void shadow_hook_remove(struct shadow_hook *hook)
  	if (!hook->installed)
  		return;
  
 -	shadow_hook_unregister_kprobe(&hook->kp);
--	hook->installed = false;
-+	shadow_inline_remove(hook);
++	if (hook->inline_active) {
++		shadow_inline_remove(hook);
++		hook->inline_active = false;
++	} else {
++		shadow_hook_unregister_kprobe(&hook->kp);
++	}
+ 	hook->installed = false;
  }
  EXPORT_SYMBOL_GPL(shadow_hook_remove);
- 
 diff --git a/glue/shadow_hook.h b/glue/shadow_hook.h
-index 6a4e1fb..d9cdf7a 100644
+index 6a4e1fb..b48056e 100644
 --- a/glue/shadow_hook.h
 +++ b/glue/shadow_hook.h
 @@ -76,6 +76,7 @@
@@ -5943,18 +5818,23 @@ index 6a4e1fb..d9cdf7a 100644
  #include <linux/ftrace.h>
  #include <linux/list.h>
  #include <linux/module.h>
-@@ -170,7 +171,13 @@ struct shadow_hook {
+@@ -170,7 +171,18 @@ struct shadow_hook {
  #if defined(CONFIG_FUNCTION_TRACER) && defined(CONFIG_DYNAMIC_FTRACE)
  	struct ftrace_ops	ops;
  #else
 -	struct kprobe		kp;
 +	/*
-+	 * [INLINE] 原来是 struct kprobe kp;，改成 inline 文本改写后端。
-+	 * 目标内核把 CONFIG_FUNCTION_TRACER 编掉时，kprobe 是唯一能用的陷阱
-+	 * 后端，但每次调用都要过一次 BRK 异常；inline 直接改写入口指令，
-+	 * 没有异常开销。见 glue/shadow_inline.c 顶部的说明。
++	 * [INLINE] 混合后端：优先 inline 文本改写，失败再用 kprobe 陷阱。
++	 *
++	 * inline 没有每次调用的异常开销（实测 fork 路径省约 90us/次），但要求
++	 * 函数入口至少能容纳 5 条指令的改写窗口；像 __arm64_sys_msgget 这种
++	 * 系统调用包装（bti + 几条 mov + 尾部 b）装不下，引擎会拒绝，此时回落
++	 * 到 kprobe。热路径（fork/clone/copy_namespaces/wake_up_new_task 等）
++	 * 都能走 inline。
 +	 */
 +	struct hk_inline	inline_hook;
++	bool			inline_active;
++	struct kprobe		kp;		/* 仅 inline 失败时使用 */
  #endif
  	bool			installed;
  	struct kretprobe	retprobe;
