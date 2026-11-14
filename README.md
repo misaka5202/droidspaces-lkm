@@ -194,14 +194,33 @@ table with `register_sysctl()` in the same shape fair.c uses (0644,
 `proc_dointvec_minmax`, default 5000), so the path is readable and writable
 rather than faked.
 
-The userns one is worth a note too, because it is subtle: publishing the symlink is
-only half the job. `nsfs_evict()` dereferences `ns->ns.ops` unconditionally,
-and the kernel's static `init_user_ns` has no ops initializer when
-`CONFIG_USER_NS=n`. A patch that only adds the procfs entry crashes the kernel
-the first time that namespace is torn down. The patch therefore also installs
-`vns_userns_operations` on the init namespace first, exactly the way
-`kernel/pid_namespace.c` already handles `init_pid_ns`, and refuses to publish
-the symlink when it cannot.
+The userns one needs three separate fixes, and each one alone produces a
+partially-working namespace that still passes `droidspaces check`:
+
+1. **Publish `/proc/<pid>/ns/user`** (`patches/0001`). Publishing the symlink is
+   only half the job: `nsfs_evict()` dereferences `ns->ns.ops` unconditionally,
+   and the kernel's static `init_user_ns` has no ops initializer when
+   `CONFIG_USER_NS=n`. A patch that only adds the procfs entry crashes the
+   kernel the first time that namespace is torn down. The patch installs
+   `vns_userns_operations` on the init namespace first, exactly the way
+   `kernel/pid_namespace.c` already handles `init_pid_ns`.
+
+2. **Fix mount namespace ownership** (`patches/0002`). Under
+   `CONFIG_USER_NS=n`, `get_user_ns()` compiles to `return &init_user_ns`,
+   ignoring its argument. `copy_mnt_ns()` uses it to pin the new mount
+   namespace's owner, so a namespace created from a child userns still belonged
+   to init -- and `may_mount()` then rejected every mount with EPERM.
+
+3. **Fix `mount_capable()`** (also `patches/0002`). The same `get_user_ns()`
+   bug makes `alloc_fs_context()` set `fc->user_ns = init`. tmpfs, proc and
+   ramfs all carry `FS_USERNS_MOUNT`, so they take the
+   `ns_capable(fc->user_ns, ...)` branch and fail. Bind mounts skip that check,
+   which is why they started working after fix 2 while tmpfs still did not.
+
+With all three, on a 6.1.157 vendor kernel: `unshare -Ur` maps root,
+`uid_map`/`gid_map` accept ranges up to 65536, and tmpfs, proc and bind mounts
+all succeed inside the namespace -- on the host and inside a Droidspaces
+container.
 
 Note that `/proc/<pid>/ns/user` answers a name lookup, not a directory
 listing: `ls /proc/self/ns/` will not show it, but `stat`/`access` succeed.

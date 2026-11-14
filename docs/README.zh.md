@@ -173,12 +173,29 @@ Droidspaces 的每一项检查现在都通过，包括三项看起来模块补�
 | `Process limit support` | `droid_lkm_pids` 用 kprobe 仿真 pids 控制器 |
 | `Sandboxing (user namespaces)` | `lkm4ctr` 通过 `patches/0001-expose-ns-user.patch` 暴露 `/proc/<pid>/ns/user` |
 
-userns 这一项值得单独说明，因为它很容易做错：**发布符号链接只是做了一半。**
-`nsfs_evict()` 会无条件解引用 `ns->ns.ops`，而内核静态的 `init_user_ns`
-在 `CONFIG_USER_NS=n` 时没有 ops 初始化器。只加 procfs 条目的补丁会在该
-命名空间第一次被销毁时把内核打崩。所以补丁先照 `kernel/pid_namespace.c`
-处理 `init_pid_ns` 的方式给 init 命名空间装上 `vns_userns_operations`，
-装不上就拒绝发布符号链接。
+userns 这一项要**三个修复叠加**，少任何一个都只会得到一个"检查全绿但用不了"
+的半成品：
+
+1. **暴露 `/proc/<pid>/ns/user`**（`patches/0001`）。发布符号链接只是做了一半：
+   `nsfs_evict()` 会无条件解引用 `ns->ns.ops`，而内核静态的 `init_user_ns`
+   在 `CONFIG_USER_NS=n` 时没有 ops 初始化器。只加 procfs 条目的补丁会在该
+   命名空间第一次被销毁时把内核打崩。所以补丁先照 `kernel/pid_namespace.c`
+   处理 `init_pid_ns` 的方式给 init 命名空间装上 `vns_userns_operations`。
+
+2. **修正 mount namespace 的归属**（`patches/0002`）。`CONFIG_USER_NS=n` 时
+   `get_user_ns()` 被编成 `return &init_user_ns`，忽略参数。`copy_mnt_ns()`
+   用它来钉住新 mount namespace 的属主，于是在子 userns 里创建出来的 mount
+   namespace 仍然"属于" init —— `may_mount()` 随即对所有挂载返回 EPERM。
+
+3. **修正 `mount_capable()`**（同样在 `patches/0002`）。同一个 `get_user_ns()`
+   bug 让 `alloc_fs_context()` 把 `fc->user_ns` 设成了 init。tmpfs / proc /
+   ramfs 都带 `FS_USERNS_MOUNT`，于是走 `ns_capable(fc->user_ns, ...)` 分支
+   失败。bind mount 不经过这个检查 —— 这也正是修完第 2 项后 bind 能用、
+   tmpfs 还不行原因。
+
+三项都到位后，6.1.157 厂商内核上：`unshare -Ur` 能映射 root，
+`uid_map`/`gid_map` 接受 65536 的范围，tmpfs / proc / bind 挂载全部成功 ——
+宿主机和 Droidspaces 容器内都一样。
 
 CPU limit 那一项也有一个容易被忽略的前提：Droidspaces 要求
 `/proc/sys/kernel/sched_cfs_bandwidth_slice_us` 存在，而这个 sysctl 是
