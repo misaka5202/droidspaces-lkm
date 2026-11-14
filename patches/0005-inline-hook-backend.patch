@@ -1,0 +1,6121 @@
+diff --git a/glue/hk/hk.c b/glue/hk/hk.c
+new file mode 100644
+index 0000000..f8aace5
+--- /dev/null
++++ b/glue/hk/hk.c
+@@ -0,0 +1,229 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2026 dere3046
++ */
++
++#include <linux/delay.h>
++#include <linux/module.h>
++#include <linux/printk.h>
++#include <linux/string.h>
++
++#include "hk.h"
++#include "hk_ptr.h"
++#include "hk_kprobe.h"
++#include "hk_kretprobe.h"
++#include "hk_redir.h"
++#include "hk_sighook.h"
++#include "hk_inline.h"
++#include "hk_patch.h"
++
++static struct hk_cfg g_cfg;
++static bool g_exiting;
++
++/*
++ * the body of a function whose address was taken is named name$type on a clang cfi
++ * build, and the suffix is not something a caller can know. the walk that used to
++ * find it goes through the kernel's symbol iterator, whose callback is four
++ * arguments on one kernel and three on another, and passing the wrong one is a cfi
++ * failure rather than a wrong answer. the stub the plain symbol names is a branch to
++ * that body, so the body is reached by following it, which costs no callback and no
++ * allocation and therefore also works from a probe handler
++ */
++#define HK_STUB_FOLLOW 8
++
++static u32 hk_read_insn(unsigned long addr)
++{
++	u32 insn = 0;
++
++	if (copy_from_kernel_nofault(&insn, (const void *)addr, sizeof(insn)))
++		return 0;
++	return insn;
++}
++
++static bool hk_insn_is_bti(u32 insn)
++{
++	return insn == 0xD503245F || insn == 0xD503249F || insn == 0xD50324DF ||
++	       insn == 0xD503251F;
++}
++
++static unsigned long __nocfi hk_follow_stub(unsigned long addr)
++{
++	int i;
++
++	for (i = 0; i < HK_STUB_FOLLOW; i++) {
++		u32 insn = hk_read_insn(addr);
++		long disp;
++
++		if (!insn)
++			return 0;
++		if (hk_insn_is_bti(insn)) {
++			addr += 4;
++			continue;
++		}
++		/* a bare branch at the entry is the stub the cfi build leaves behind */
++		if ((insn & 0xFC000000) != 0x14000000)
++			return addr;
++		disp = (long)(insn & 0x03FFFFFF) << 2;
++		if (disp & (1L << 27))
++			disp |= ~((1L << 28) - 1);
++		addr += disp;
++	}
++	return 0;
++}
++
++static unsigned long __nocfi hk_resolve_cfi(const char *name)
++{
++	unsigned long addr = 0;
++
++	/* asking hk_resolve here would ask this function again */
++	if (g_cfg.resolve && !g_exiting)
++		addr = g_cfg.resolve(name);
++	if (!addr || !hk_ker_addr_ok(addr))
++		return 0;
++	return hk_follow_stub(addr);
++}
++
++__nocfi noinline unsigned long hk_resolve(const char *name)
++{
++	unsigned long addr;
++
++	if (!name)
++		return 0;
++	if (g_cfg.resolve && !g_exiting) {
++		addr = g_cfg.resolve(name);
++		if (addr && hk_ker_addr_ok(addr))
++			return addr;
++	}
++	addr = hk_resolve_cfi(name);
++	if (addr && hk_ker_addr_ok(addr))
++		return addr;
++	return 0;
++}
++
++int hk_init(const struct hk_cfg *cfg)
++{
++	if (!cfg || !cfg->resolve)
++		return -EINVAL;
++	if (g_cfg.resolve && !g_exiting)
++		return -EALREADY;
++
++	g_cfg = *cfg;
++	g_exiting = false;
++	hk_patch_set_write(cfg->write);
++	/*
++	 * resolve the write path symbols here and not on first use: a lazy resolve
++	 * inside stop_machine would walk kallsyms from an atomic context
++	 */
++	hk_patch_init();
++	pr_info("[lkmhook] init\n");
++	return 0;
++}
++
++typedef void (*hk_synchronize_rcu_tasks_fn)(void);
++
++/*
++ * __nocfi on the body, not decoration: the symbol is resolved at runtime and the
++ * call is indirect, and the cfi typeid the compiler would check it against is not
++ * the one the kernel recorded. 5.10 panics on it, the target named in the message
++ */
++__nocfi /*
++ * the default notice is a warning, the level this library uses for a condition it
++ * refused and carried on from: the mistake belongs to the caller of the hook, not
++ * to the kernel, and a caller that wants it louder escalates in its own sink
++ */
++static void hk_notice_print(enum hk_notice what, const char *detail)
++{
++	static const char *const names[] = {
++		"free before disable",
++		"relo table",
++	};
++
++	pr_warn("[lkmhook] %s: %s\n",
++	       what < ARRAY_SIZE(names) ? names[what] : "notice",
++	       detail ? detail : "");
++}
++
++static hk_notify_fn g_notify = hk_notice_print;
++
++void hk_notice_set(hk_notify_fn fn)
++{
++	WRITE_ONCE(g_notify, fn);
++}
++
++void hk_notice(enum hk_notice what, const char *detail)
++{
++	hk_notify_fn fn = READ_ONCE(g_notify);
++
++	if (fn)
++		fn(what, detail);
++}
++
++/*
++ * the call inside is indirect and cfi is off for it, and noinline is the other
++ * half of that: an inline would move the call into whatever caller lto picked, and
++ * the check __nocfi turned off would come back with it
++ */
++__nocfi noinline void hk_wait_tasks_rcu(void)
++{
++	hk_synchronize_rcu_tasks_fn fn;
++	unsigned long sym = hk_resolve("synchronize_rcu_tasks");
++
++	if (!sym || !hk_ker_addr_ok(sym)) {
++		pr_warn_once("[lkmhook] synchronize_rcu_tasks not found, "
++			     "a freed trampoline may still be running\n");
++		return;
++	}
++	fn = (hk_synchronize_rcu_tasks_fn)sym;
++	fn();
++}
++
++void hk_exit(void)
++{
++	/*
++	 * called by hk_exit_block in a loop, so a restore that failed is retried.
++	 * the flag keeps the injected resolver out of the retry, a consumer that
++	 * tears its resolver down before hk_exit_block would otherwise resolve
++	 * through a freed pointer, and it is what makes a clean shutdown
++	 * initialize again instead of -EALREADY
++	 */
++	g_exiting = true;
++	hk_sighook_exit();
++	hk_kprobe_exit();
++	hk_kretprobe_exit();
++	hk_ptr_exit();
++	hk_inline_exit();
++	pr_info("[lkmhook] exit\n");
++}
++
++/*
++ * rmmod unmaps module text and data as soon as the exit path returns, and the
++ * entry of a hook that could not be restored still branches into the trampoline
++ * allocated here. the module ends its exit path through this instead of
++ * returning to its caller while a hook is still live: the detour keeps its
++ * bytes, so the kernel stays correct, and the rmmod request is the only thing
++ * that is refused. it never returns
++ */
++void hk_exit_block(void)
++{
++	unsigned int left;
++
++	for (;;) {
++		/*
++		 * the calls inside a replacement are counted here too: their code is
++		 * this module's, and the reference they hold is what keeps the kernel
++		 * from unmapping it, so a clean exit waits for them as well
++		 */
++		left = hk_inline_pending() + hk_ptr_pending() +
++		       hk_kprobe_pending() + hk_kretprobe_pending() +
++		       hk_redir_pending() + hk_redir_inflight();
++		if (!left)
++			break;
++		pr_warn("[lkmhook] exit blocked, %u hook(s) still live\n", left);
++		ssleep(60);
++		hk_inline_exit();
++		hk_ptr_exit();
++		hk_kretprobe_exit();
++	}
++	pr_info("[lkmhook] exit clean\n");
++	g_exiting = false;
++}
+diff --git a/glue/hk/hk.h b/glue/hk/hk.h
+new file mode 100644
+index 0000000..056e134
+--- /dev/null
++++ b/glue/hk/hk.h
+@@ -0,0 +1,69 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2026 dere3046
++ */
++
++#ifndef LKMHOOK_HK_H
++#define LKMHOOK_HK_H
++
++#include <linux/types.h>
++
++struct hk_cfg {
++	unsigned long (*resolve)(const char *name);
++	/*
++	 * how the library writes text when a caller does not name a path itself,
++	 * one of the hk_write_* primitives of hk_patch.h. NULL takes the kernel's
++	 * own primitive, which assumes nothing about the headers this module was
++	 * built with. the value is read once, in hk_init
++	 */
++	int (*write)(void *dst, const void *src, size_t len);
++};
++
++static inline bool hk_ker_addr_ok(unsigned long v)
++{
++	return v >= 0xffff000000000000UL;
++}
++
++int hk_init(const struct hk_cfg *cfg);
++void hk_exit(void);
++unsigned long hk_resolve(const char *name);
++
++/*
++ * the consumers run their own exit, the library only counts the failures it was
++ * told about and keeps the numbers for the next hk_exit. a module whose exit
++ * path left kernel text pointing into module memory must not unload, so it calls
++ * hk_exit_block at the end of its own exit and never returns
++ */
++void hk_exit_fail(int count);
++unsigned int hk_exit_failed(void);
++void hk_exit_block(void);
++
++/*
++ * the library refuses something and carries on, and says so here. a refused free
++ * of a live hook and an emitter that disagrees with the length table both leave the
++ * hook or the install in a state the caller wanted, so a caller that wants to count
++ * them, log them its own way or trip an assertion of its own installs a notice
++ * function. the default notice prints, which is the report a plain build has, and
++ * hk_notice_set(NULL) silences it for a build that trusts itself
++ */
++enum hk_notice {
++	HK_NOTICE_FREE_BEFORE_DISABLE = 0,	/* a free on a hook that is still live */
++	HK_NOTICE_RELO_TABLE,			/* an emitter and the length table disagree */
++};
++
++typedef void (*hk_notify_fn)(enum hk_notice what, const char *detail);
++
++/* called where the refusal happens: process context, and it must not sleep */
++void hk_notice_set(hk_notify_fn fn);
++void hk_notice(enum hk_notice what, const char *detail);
++
++/*
++ * one tasks rcu grace period: what has to pass between the moment code of this
++ * module is taken out of a path another core could be running and the moment it is
++ * freed. it is the flavour the kernel uses for its own text pokes, the symbol is
++ * resolved here, and a kernel without it says so once instead of waiting for
++ * nothing. the call inside is indirect and cfi is off for it, a direct call from a
++ * consumer needs nothing
++ */
++void hk_wait_tasks_rcu(void);
++#endif
+diff --git a/glue/hk/hk_cfi.c b/glue/hk/hk_cfi.c
+new file mode 100644
+index 0000000..9f19933
+--- /dev/null
++++ b/glue/hk/hk_cfi.c
+@@ -0,0 +1,75 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2026 dere3046
++ */
++
++#include <linux/errno.h>
++#include <linux/kernel.h>
++#include <linux/printk.h>
++#include <linux/types.h>
++#include <linux/uaccess.h>
++
++#include "hk.h"
++#include "hk_patch.h"
++#include "hk_cfi.h"
++
++#define HK_CFI_RET 0xD65F03C0
++#define HK_CFI_MOV 0xD2800020
++
++static int hk_patch_ret_addr(const char *what, unsigned long fn)
++{
++	u32 cur;
++	u32 ret = HK_CFI_RET;
++
++	if (!fn || !hk_ker_addr_ok(fn))
++		return -ENOENT;
++	if (copy_from_kernel_nofault(&cur, (void *)fn, sizeof(cur)))
++		return -EFAULT;
++	if (cur == ret)
++		return 0;
++	hk_write_text((void *)fn, &ret, 4);
++	pr_info("[lkmhook] cfi bypass %s\n", what);
++	return 0;
++}
++
++static int hk_patch_ret(const char *name)
++{
++	return hk_patch_ret_addr(name, hk_resolve(name));
++}
++
++static int hk_patch_mov_ret_addr(const char *what, unsigned long fn)
++{
++	u32 mov_ret[2] = { HK_CFI_MOV, HK_CFI_RET };
++	u32 cur;
++
++	if (!fn || !hk_ker_addr_ok(fn))
++		return -ENOENT;
++	if (copy_from_kernel_nofault(&cur, (void *)fn, sizeof(cur)))
++		return -EFAULT;
++	if (cur == mov_ret[0])
++		return 0;
++	hk_write_text((void *)fn, mov_ret, sizeof(mov_ret));
++	pr_info("[lkmhook] cfi bypass %s\n", what);
++	return 0;
++}
++
++int hk_cfi_bypass(void)
++{
++	static const char *const ret_syms[] = {
++		"cfi_failure_handler",
++		"__cfi_check_fail",
++		"__ubsan_handle_cfi_check_fail_abort",
++		"__ubsan_handle_cfi_check_fail",
++		"__cfi_slowpath",
++		"__cfi_slowpath_diag",
++		"_cfi_slowpath",
++	};
++	unsigned long fn;
++	int i;
++
++	for (i = 0; i < (int)ARRAY_SIZE(ret_syms); i++)
++		hk_patch_ret(ret_syms[i]);
++	fn = hk_resolve("report_cfi_failure");
++	hk_patch_mov_ret_addr("report_cfi_failure", fn);
++	return 0;
++}
+diff --git a/glue/hk/hk_cfi.h b/glue/hk/hk_cfi.h
+new file mode 100644
+index 0000000..b5b91fa
+--- /dev/null
++++ b/glue/hk/hk_cfi.h
+@@ -0,0 +1,11 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2026 dere3046
++ */
++
++#ifndef LKMHOOK_HK_CFI_H
++#define LKMHOOK_HK_CFI_H
++
++int hk_cfi_bypass(void);
++
++#endif
+diff --git a/glue/hk/hk_flush.S b/glue/hk/hk_flush.S
+new file mode 100644
+index 0000000..08d0d2f
+--- /dev/null
++++ b/glue/hk/hk_flush.S
+@@ -0,0 +1,14 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2026 dere3046
++ */
++
++.section .text
++.global hk_flush_icache
++.type hk_flush_icache, %function
++hk_flush_icache:
++	ic ivau, x0
++	dsb ish
++	isb
++	ret
++.size hk_flush_icache, . - hk_flush_icache
+diff --git a/glue/hk/hk_inline.c b/glue/hk/hk_inline.c
+new file mode 100644
+index 0000000..eeaed5d
+--- /dev/null
++++ b/glue/hk/hk_inline.c
+@@ -0,0 +1,1438 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2026 dere3046
++ */
++
++#include <linux/errno.h>
++#include <linux/list.h>
++#include <asm/tlbflush.h>
++#include <linux/mm.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/kernel.h>
++#include <linux/printk.h>
++#include <linux/rcupdate_trace.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/types.h>
++#include <linux/uaccess.h>
++#include <linux/version.h>
++#include <linux/vmalloc.h>
++
++#include "hk.h"
++#include "hk_patch.h"
++#include "hk_inline.h"
++
++#define HK_TRAMP_SIZE 4096
++
++/*
++ * [安全] tramp 暂存区的容量必须能装下最坏情况：
++ *   6 字头（bti + ldr/ret + wrapper 地址 + bti）
++ * + HK_INLINE_ENTRY_MAX 条，每条最多 8 字（hk_relo_len 的最大值）
++ * + 6 字收尾 stub
++ * 现在 ENTRY_MAX=5 时是 52 字，与 256 字节（64 字）刚好有空余；一旦把
++ * 窗口调大或新增更长的指令类，下面这条断言会在编译期直接失败，而不是
++ * 在运行时把栈/堆写穿。
++ */
++#define HK_TRAMP_STAGE_WORDS 64
++static_assert(6 + HK_INLINE_ENTRY_MAX * 8 + 6 <= HK_TRAMP_STAGE_WORDS,
++	      "tramp staging buffer cannot hold the window plus the stub");
++#define HK_INS_LDR_X17 0x58000051
++#define HK_INS_LDR_X17_P12 0x58000071
++#define HK_INS_B_X12 0x14000003
++#define HK_INS_BR_X17 0xD61F0220
++#define HK_INS_RET_X17 0xD65F0220
++#define HK_INS_BLR_X17 0xD63F0220
++#define HK_INS_NOP 0xD503201F
++#define HK_INS_BTI_JC 0xD50324DF
++#define HK_INS_BR_ANY 0xD61F0000
++#define HK_INS_BR_MASK 0xFFFFFC1F
++#define HK_INS_BRK_ANY 0xD4200000
++#define HK_INS_BRK_MASK 0xFFE00000
++#define HK_INS_MOV_MASK 0x7F800000
++#define HK_INS_MOVZ 0x52800000
++#define HK_INS_MOVK 0x72800000
++#define HK_INS_MOV_X9_LR 0xAA1E03E9
++
++/* bit 50 of an arm64 pte, the BTI guarded attribute of the page */
++#define HK_PTE_GP 0x0004000000000000UL
++
++#define HK_BTI_GUARDED(_pte) ((_pte) & HK_PTE_GP)
++
++/* dry run sink for the probe, the tables allow 8 words per instruction */
++#define HK_PROBE_SCRATCH 128
++
++/* serializes every install and restore, see the note at the lock site */
++static DEFINE_MUTEX(g_inline_lock);
++
++/*
++ * one node per live hook window, under g_inline_lock. the window belongs to the
++ * install and is handed back by hk_inline_disable or hk_inline_free, so a second
++ * hook can take the address once the first entry is restored. the hook pointer
++ * is the name of the node, a symbol the caller keeps alive while it is hooked
++ */
++struct hk_inline_own {
++	struct list_head list;
++	struct hk_inline *hook;
++	unsigned long start;
++	u32 len;
++};
++
++static LIST_HEAD(g_inline_owned);
++
++/*
++ * an unload that could not finish. the trampoline is still reachable from the
++ * entry, so it must not be freed, and rmmod must not be allowed to unmap it. the
++ * node is the only thing the exit gate needs to retry
++ */
++struct hk_inline_pending {
++	struct list_head list;
++	struct hk_inline *hook;
++};
++
++static LIST_HEAD(g_inline_pending);
++
++typedef enum {
++	HK_INST_B = 1,
++	HK_INST_BC,
++	HK_INST_BL,
++	HK_INST_ADR,
++	HK_INST_ADRP,
++	HK_INST_LDR_32,
++	HK_INST_LDR_64,
++	HK_INST_LDRSW,
++	HK_INST_PRFM,
++	HK_INST_LDR_SIMD_32,
++	HK_INST_LDR_SIMD_64,
++	HK_INST_LDR_SIMD_128,
++	HK_INST_CBZ,
++	HK_INST_CBNZ,
++	HK_INST_TBZ,
++	HK_INST_TBNZ,
++	HK_INST_IGNORE,
++} hk_inst_type_t;
++
++static const u32 hk_masks[] = {
++	0xFC000000, 0xFF000010, 0xFC000000, 0x9F000000, 0x9F000000,
++	0xFF000000, 0xFF000000, 0xFF000000, 0xFF000000,
++	0xFF000000, 0xFF000000, 0xFF000000,
++	0x7F000000, 0x7F000000, 0x7F000000, 0x7F000000,
++	0x00000000,
++};
++
++static const u32 hk_types[] = {
++	0x14000000, 0x54000000, 0x94000000, 0x10000000, 0x90000000,
++	0x18000000, 0x58000000, 0x98000000, 0xD8000000,
++	0x1C000000, 0x5C000000, 0x9C000000,
++	0x34000000, 0x35000000, 0x36000000, 0x37000000,
++	0x00000000,
++};
++
++/*
++ * words the relocation of one instruction emits. it has to match the emitters
++ * below exactly, hk_relo_in_tramp walks these numbers to turn an address inside
++ * the patched window into the address the same instruction has in the trampoline
++ */
++static const int hk_relo_len[] = {
++	6, 8, 6, 4, 4,
++	5, 5, 5, 7, 7, 7, 7,
++	8, 8, 8, 8,
++	2,
++};
++
++/*
++ * the three tables are indexed by the same instruction class, and the compiler
++ * can hold that: a class added to the enum without a mask, a type pattern and a
++ * length is a build error and not a wrong trampoline at runtime
++ */
++static_assert(ARRAY_SIZE(hk_masks) == ARRAY_SIZE(hk_types),
++	      "the class masks and the class patterns disagree");
++static_assert(ARRAY_SIZE(hk_relo_len) == ARRAY_SIZE(hk_masks),
++	      "the relocation lengths and the instruction classes disagree");
++
++static __nocfi u32 hk_get_insn(const u8 *p)
++{
++	return le32_to_cpu(*(const u32 *)p);
++}
++
++static __nocfi long hk_sext(u64 v, int bits)
++{
++	if (bits < 64 && (v & (1ULL << (bits - 1))))
++		v |= ~0ULL << bits;
++	return (long)v;
++}
++
++static __nocfi __maybe_unused u32 hk_enc_movz(u32 rd, u32 imm, u32 hw)
++{
++	return 0xD2800000 | (hw << 21) | ((imm & 0xFFFF) << 5) | rd;
++}
++
++static __nocfi __maybe_unused u32 hk_enc_movk(u32 rd, u32 imm, u32 hw)
++{
++	return 0xF2800000 | (hw << 21) | ((imm & 0xFFFF) << 5) | rd;
++}
++
++static bool hk_is_b(u32 insn)
++{
++	return (insn & hk_masks[0]) == hk_types[0];
++}
++
++static bool hk_is_hint(u32 insn)
++{
++	return (insn & 0xFFFFFC1F) == 0xD503201F;
++}
++
++static u64 hk_decode_b_target(u32 insn, u64 pc)
++{
++	return pc + hk_sext(insn & 0x03FFFFFF, 26) * 4;
++}
++
++/* a resolver result can be stale and a b target is arithmetic, so neither the
++ * probe nor the branch walk dereferences one directly */
++static __nocfi int hk_read_code(unsigned long addr, void *dst, size_t len)
++{
++	return copy_from_kernel_nofault(dst, (const void *)addr, len);
++}
++
++static __nocfi int hk_fetch_insn(unsigned long addr, u32 *out)
++{
++	u8 raw[4];
++
++	if (hk_read_code(addr, raw, sizeof(raw)))
++		return -EFAULT;
++	*out = hk_get_insn(raw);
++	return 0;
++}
++
++/*
++ * the entry a hook patches: a symbolic entry is often a thunk of b or of a hint
++ * followed by b, and patching the thunk leaves the real body alone. the walk
++ * reads through the nofault helper, a chain that cannot be read stops the walk
++ * and every hook that lands on an unreadable target is refused later
++ */
++static __nocfi int hk_resolve_branch_chain(unsigned long addr,
++					   unsigned long *out)
++{
++	u32 insn;
++	u32 next;
++	int depth;
++
++	for (depth = 0; depth < 32; depth++) {
++		if (hk_fetch_insn(addr, &insn))
++			return -EFAULT;
++		if (hk_is_b(insn)) {
++			addr = hk_decode_b_target(insn, addr);
++			continue;
++		}
++		if (!hk_is_hint(insn))
++			break;
++		if (hk_fetch_insn(addr + 4, &next))
++			return -EFAULT;
++		if (!hk_is_b(next))
++			break;
++		addr = hk_decode_b_target(next, addr + 4);
++	}
++	*out = addr;
++	return 0;
++}
++
++struct hk_relo_ctx {
++	u32 *dst;
++	u32 count;
++	const u8 *src;		/* entry window copy, NULL reads tramp_start */
++	unsigned long inst_addr;
++	unsigned long tramp_start;
++	unsigned long tramp_end;
++	unsigned long backup_start;
++};
++
++static __nocfi hk_inst_type_t hk_insn_type(u32 insn)
++{
++	int i;
++
++	for (i = 0; i < (int)ARRAY_SIZE(hk_masks); i++)
++		if ((insn & hk_masks[i]) == hk_types[i])
++			return (hk_inst_type_t)(i + 1);
++	return HK_INST_IGNORE;
++}
++
++/* the tables are 0 based, the instruction types are not */
++static int hk_insn_index(u32 insn)
++{
++	return (int)hk_insn_type(insn) - 1;
++}
++
++static bool hk_in_tramp(const struct hk_relo_ctx *c, u64 addr)
++{
++	return addr >= c->tramp_start && addr < c->tramp_end;
++}
++
++/*
++ * an operand that points back into the window has to point at the copy of that
++ * instruction in the trampoline after relocation, and the copy sits at the sum
++ * of the lengths of everything emitted before it
++ */
++/*
++ * [安全] 越界读修复。
++ *
++ * 原实现直接 hk_relo_len[hk_insn_index(inst)]，而 hk_insn_index() 对没能
++ * 归类的指令返回 -1（HK_INST_IGNORE）。-1 索引会读到数组前面，fix 变成
++ * 垃圾值，trampoline 里的目标地址随之算错，最终写坏内核文本。
++ *
++ * 之所以会真的取到 -1：操作数可以前向引用窗口里更靠后的指令（adr / ldr
++ * 字面量 / b 往前跳），而那些指令在本次 relocate 时还没被归类验证。
++ *
++ * 现在遇到未归类指令就让 *ok = false，由调用方放弃这次 hook（返回
++ * -EOPNOTSUPP），绝不用垃圾地址去写文本。
++ */
++static u64 hk_relo_in_tramp(const struct hk_relo_ctx *c, u64 addr, bool *ok)
++{
++	const u8 *src = c->src ? c->src : (const u8 *)c->tramp_start;
++	u64 fix = c->backup_start;
++	u32 idx;
++	u32 inst;
++	u32 j;
++
++	*ok = true;
++	if (!hk_in_tramp(c, addr))
++		return addr;
++	idx = (addr - c->tramp_start) / 4;
++	if (idx >= HK_INLINE_ENTRY_MAX)
++		return addr;
++	for (j = 0; j < idx; j++) {
++		int k;
++
++		inst = hk_get_insn(src + j * 4);
++		k = hk_insn_index(inst);
++		if (k < 0) {
++			*ok = false;
++			return addr;
++		}
++		fix += hk_relo_len[k] * 4;
++	}
++	return fix;
++}
++
++/*
++ * ldr x17, #8 ; b #12 ; lo ; hi ; br x17 ; nop
++ * the literal sits behind the branch so the sequence is one straight line and
++ * four words is the shortest form, the nop keeps every emission the same length
++ */
++static __nocfi int hk_relo_stub(struct hk_relo_ctx *c, u64 addr, bool wrap)
++{
++	c->dst[c->count++] = HK_INS_LDR_X17;
++	c->dst[c->count++] = 0x14000003;
++	c->dst[c->count++] = addr & 0xFFFFFFFF;
++	c->dst[c->count++] = addr >> 32;
++	if (wrap)
++		c->dst[c->count++] = HK_INS_BR_X17;
++	else
++		c->dst[c->count++] = HK_INS_RET_X17;
++	c->dst[c->count++] = HK_INS_NOP;
++	return 0;
++}
++
++static __nocfi __maybe_unused int hk_relo_abs_jump(struct hk_relo_ctx *c, u64 target)
++{
++	c->dst[c->count++] = HK_INS_LDR_X17;
++	c->dst[c->count++] = HK_INS_RET_X17;
++	c->dst[c->count++] = target & 0xFFFFFFFF;
++	c->dst[c->count++] = target >> 32;
++	return 0;
++}
++
++static __nocfi int hk_relo_b(struct hk_relo_ctx *c, u32 insn,
++			     hk_inst_type_t type)
++{
++	bool relo_ok;
++	u64 disp;
++	u64 addr;
++
++	if (type == HK_INST_BC)
++		disp = hk_sext((insn >> 5) & 0x7FFFF, 19) << 2;
++	else
++		disp = hk_sext(insn & 0x03FFFFFF, 26) << 2;
++	addr = c->inst_addr + disp;
++	addr = hk_relo_in_tramp(c, addr, &relo_ok);
++	if (!relo_ok)
++		return -EOPNOTSUPP;
++
++	/*
++	 * a conditional branch has to keep its own two instruction test and land
++	 * on the stub that follows it, so it is rewritten to skip four words
++	 * instead of three
++	 */
++	if (type == HK_INST_BC) {
++		c->dst[c->count++] = (insn & 0xFF00001F) | 0x40;
++		c->dst[c->count++] = 0x14000006;
++	}
++	return hk_relo_stub(c, addr, type != HK_INST_BL);
++}
++
++/*
++ * the immediate an adr or adrp carries, split across two fields: the high one has
++ * to be shifted into place before the low one joins it
++ */
++static __nocfi long hk_adr_imm(u32 insn)
++{
++	return hk_sext((((insn >> 5) & 0x7FFFF) << 2) | ((insn >> 29) & 0x3), 21);
++}
++
++static __nocfi int hk_relo_bl(struct hk_relo_ctx *c, u32 insn)
++{
++	bool relo_ok;
++	u64 addr = c->inst_addr + hk_sext(insn & 0x03FFFFFF, 26) * 4;
++
++	addr = hk_relo_in_tramp(c, addr, &relo_ok);
++	if (!relo_ok)
++		return -EOPNOTSUPP;
++	/*
++	 * the call returns to the word after blr, so a branch has to sit there and
++	 * carry it over the literal, or the return lands inside it
++	 */
++	c->dst[c->count++] = HK_INS_LDR_X17_P12;
++	c->dst[c->count++] = HK_INS_BLR_X17;
++	c->dst[c->count++] = HK_INS_B_X12;
++	c->dst[c->count++] = addr & 0xFFFFFFFF;
++	c->dst[c->count++] = addr >> 32;
++	c->dst[c->count++] = HK_INS_NOP;
++	return 0;
++}
++
++static __nocfi int hk_relo_adr(struct hk_relo_ctx *c, u32 insn,
++			       hk_inst_type_t type)
++{
++	u32 xd = insn & 0x1F;
++	u64 addr;
++
++	if (type == HK_INST_ADR) {
++		addr = c->inst_addr + hk_adr_imm(insn);
++	} else {
++		/*
++		 * the immediate of adrp counts pages, so the byte offset is that
++		 * count times the page size, not the count itself
++		 */
++		addr = (c->inst_addr & ~0xFFFUL) +
++		       (u64)(hk_adr_imm(insn) * 4096);
++		if (hk_in_tramp(c, addr))
++			return -EOPNOTSUPP;
++	}
++	c->dst[c->count++] = 0x58000040 | xd;
++	c->dst[c->count++] = HK_INS_B_X12;
++	c->dst[c->count++] = addr & 0xFFFFFFFF;
++	c->dst[c->count++] = addr >> 32;
++	return 0;
++}
++
++static __nocfi int hk_relo_ldr(struct hk_relo_ctx *c, u32 insn,
++			       hk_inst_type_t type)
++{
++	bool relo_ok;
++	u32 rt = insn & 0x1F;
++	u64 addr = c->inst_addr + hk_sext((insn >> 5) & 0x7FFFF, 19) * 4;
++
++	if (hk_in_tramp(c, addr) && type != HK_INST_PRFM)
++		return -EOPNOTSUPP;
++	addr = hk_relo_in_tramp(c, addr, &relo_ok);
++	if (!relo_ok)
++		return -EOPNOTSUPP;
++
++	if (type == HK_INST_LDR_32 || type == HK_INST_LDR_64 ||
++	    type == HK_INST_LDRSW) {
++		u32 op;
++
++		if (type == HK_INST_LDR_32)
++			op = 0xB9400000;
++		else if (type == HK_INST_LDR_64)
++			op = 0xF9400000;
++		else
++			op = 0xB9800000;
++		c->dst[c->count++] = 0x58000060 | rt;
++		c->dst[c->count++] = op | rt | (rt << 5);
++		c->dst[c->count++] = 0x14000003;
++		c->dst[c->count++] = addr & 0xFFFFFFFF;
++		c->dst[c->count++] = addr >> 32;
++	} else {
++		u32 op;
++
++		/*
++		 * the simd and prefetch literals are read into a register the
++		 * original instruction does not name, so x16 and x17 are saved
++		 * around the load and restored after it
++		 */
++		if (type == HK_INST_PRFM)
++			op = 0xF9800220;
++		else if (type == HK_INST_LDR_SIMD_32)
++			op = 0xBD400220;
++		else if (type == HK_INST_LDR_SIMD_64)
++			op = 0xFD400220;
++		else
++			op = 0x3DC00220;
++		c->dst[c->count++] = 0xA93F47F0;
++		c->dst[c->count++] = 0x58000091;
++		c->dst[c->count++] = op | rt;
++		c->dst[c->count++] = 0xA8C147F0;
++		c->dst[c->count++] = 0x14000003;
++		c->dst[c->count++] = addr & 0xFFFFFFFF;
++		c->dst[c->count++] = addr >> 32;
++	}
++	return 0;
++}
++
++static __nocfi int hk_relo_cb(struct hk_relo_ctx *c, u32 insn)
++{
++	bool relo_ok;
++	u64 addr = c->inst_addr + hk_sext((insn >> 5) & 0x7FFFF, 19) * 4;
++
++	addr = hk_relo_in_tramp(c, addr, &relo_ok);
++	if (!relo_ok)
++		return -EOPNOTSUPP;
++	c->dst[c->count++] = (insn & 0xFF00001F) | 0x40;
++	c->dst[c->count++] = 0x14000006;
++	return hk_relo_stub(c, addr, true);
++}
++
++static __nocfi int hk_relo_tb(struct hk_relo_ctx *c, u32 insn)
++{
++	bool relo_ok;
++	u64 addr = c->inst_addr + hk_sext((insn >> 5) & 0x3FFF, 14) * 4;
++
++	addr = hk_relo_in_tramp(c, addr, &relo_ok);
++	if (!relo_ok)
++		return -EOPNOTSUPP;
++	c->dst[c->count++] = (insn & 0xFFF8001F) | 0x40;
++	c->dst[c->count++] = 0x14000006;
++	return hk_relo_stub(c, addr, true);
++}
++
++static __nocfi int hk_relo_inst(struct hk_relo_ctx *c, u32 insn)
++{
++	int ret;
++
++	switch (hk_insn_type(insn)) {
++	case HK_INST_B:
++	case HK_INST_BC:
++		ret = hk_relo_b(c, insn, hk_insn_type(insn));
++		break;
++	case HK_INST_BL:
++		ret = hk_relo_bl(c, insn);
++		break;
++	case HK_INST_ADR:
++	case HK_INST_ADRP:
++		ret = hk_relo_adr(c, insn, hk_insn_type(insn));
++		break;
++	case HK_INST_LDR_32:
++	case HK_INST_LDR_64:
++	case HK_INST_LDRSW:
++	case HK_INST_PRFM:
++	case HK_INST_LDR_SIMD_32:
++	case HK_INST_LDR_SIMD_64:
++	case HK_INST_LDR_SIMD_128:
++		ret = hk_relo_ldr(c, insn, hk_insn_type(insn));
++		break;
++	case HK_INST_CBZ:
++	case HK_INST_CBNZ:
++		ret = hk_relo_cb(c, insn);
++		break;
++	case HK_INST_TBZ:
++	case HK_INST_TBNZ:
++		ret = hk_relo_tb(c, insn);
++		break;
++	default:
++		c->dst[c->count++] = insn;
++		c->dst[c->count++] = HK_INS_NOP;
++		ret = 0;
++		break;
++	}
++	return ret;
++}
++
++/* one class, one swing at the emitters: the api note is in the header */
++int hk_relo_check(void)
++{
++	u32 dst[HK_INLINE_ENTRY_MAX * 8];
++	u32 window[HK_INLINE_ENTRY_MAX];
++	unsigned long base = (unsigned long)&hk_relo_check;
++	struct hk_relo_ctx c;
++	char detail[64];
++	u32 i;
++	u32 j;
++	int ret;
++
++	for (i = 0; i < ARRAY_SIZE(hk_relo_len); i++) {
++		if (hk_insn_index(hk_types[i]) != (int)i) {
++			scnprintf(detail, sizeof(detail),
++				  "class %u matches class %d first", i,
++				  hk_insn_index(hk_types[i]));
++			hk_notice(HK_NOTICE_RELO_TABLE, detail);
++			return -EIO;
++		}
++		memset(&c, 0, sizeof(c));
++		memset(window, 0, sizeof(window));
++		window[0] = hk_types[i];
++		for (j = 1; j < HK_INLINE_ENTRY_MAX; j++)
++			window[j] = HK_INS_NOP;
++		c.dst = dst;
++		c.src = (const u8 *)window;
++		c.inst_addr = base;
++		c.tramp_start = base + 0x1000;
++		c.tramp_end = base + 0x1000 + HK_INLINE_PATCH_LEN;
++		c.backup_start = base + 0x2000;
++		memset(dst, 0, sizeof(dst));
++		ret = hk_relo_inst(&c, window[0]);
++		if (ret)
++			return ret;
++		if (c.count != (u32)hk_relo_len[i]) {
++			scnprintf(detail, sizeof(detail),
++				  "class %u emitted %u words, the table says %d",
++				  i, c.count, hk_relo_len[i]);
++			hk_notice(HK_NOTICE_RELO_TABLE, detail);
++			return -EIO;
++		}
++	}
++	return 0;
++}
++
++typedef void *(*hk_vmalloc_node_range_fn)(unsigned long size,
++					  unsigned long align,
++					  unsigned long start,
++					  unsigned long end,
++					  gfp_t gfp_mask,
++					  pgprot_t prot,
++					  unsigned long vm_flags,
++					  int node,
++					  const void *caller);
++
++static __nocfi noinline void *hk_exec_alloc(unsigned long size)
++{
++	hk_vmalloc_node_range_fn fn;
++	const char *name = "__vmalloc_node_range";
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
++	name = "__vmalloc_node_range_noprof";
++#endif
++	fn = (hk_vmalloc_node_range_fn)hk_resolve(name);
++	if (!fn || !hk_ker_addr_ok((unsigned long)fn))
++		return NULL;
++	return fn(size, 1, VMALLOC_START, VMALLOC_END,
++		  GFP_KERNEL | __GFP_NOWARN, PAGE_KERNEL_EXEC,
++		  VM_FLUSH_RESET_PERMS, NUMA_NO_NODE,
++		  __builtin_return_address(0));
++}
++
++static __nocfi noinline void hk_exec_free(void *mem)
++{
++	vfree(mem);
++}
++
++/* the entry address a hook on sym patches: the resolver result with the same
++ * branch chain walked, so the collision window and the probe agree */
++static __nocfi int hk_read_addr(const char *sym, unsigned long *out)
++{
++	unsigned long addr;
++	int ret;
++
++	addr = hk_resolve(sym);
++	if (!addr)
++		return -ENOENT;
++	ret = hk_resolve_branch_chain(addr, &addr);
++	if (ret)
++		return ret;
++	if (!hk_ker_addr_ok(addr))
++		return -EINVAL;
++	*out = addr;
++	return 0;
++}
++
++/* the window of another live hook that overlaps [start, start + len), NULL when
++ * the range is free. the caller holds g_inline_lock */
++static const struct hk_inline_own *hk_inline_overlap(unsigned long start,
++						     u32 len)
++{
++	const struct hk_inline_own *ent;
++	unsigned long end = start + len;
++
++	list_for_each_entry(ent, &g_inline_owned, list) {
++		if (start < ent->start + ent->len && ent->start < end)
++			return ent;
++	}
++	return NULL;
++}
++
++/* name both sides of the overlap, the caller holds g_inline_lock */
++static void hk_inline_report(const char *what, const char *sym,
++			     unsigned long start, u32 len,
++			     const struct hk_inline_own *other)
++{
++	pr_warn("[lkmhook] %s %s window 0x%lx+%u collides with %s 0x%lx+%u\n",
++		what, sym, start, len,
++		other->hook->name ? other->hook->name : "?",
++		other->start, other->len);
++}
++
++/*
++ * claim [start, start + len) for h, -EBUSY when another live hook owns part of
++ * it. a claim is taken before any text is read or written and a failed install
++ * hands it back, so every claim has an owner that can release it
++ */
++/*
++ * the engine writes its own trampoline and jump stubs, which live in module memory,
++ * and it writes the target text. a module address is vmalloc, so on a kernel whose
++ * vmalloc_to_page predates leaf handling the kernel primitive cannot reach it, and
++ * the configured path is therefore only taken where the kernel can take it
++ */
++static int hk_engine_write(void *dst, const void *src, size_t len)
++{
++	if (!hk_patch_kernel_primitive_ok((unsigned long)dst))
++		return hk_write_fixmap(dst, src, len);
++	return hk_write_text(dst, src, len);
++}
++
++static int hk_inline_own(struct hk_inline *h, const char *sym,
++			 unsigned long start, u32 len)
++{
++	const struct hk_inline_own *other;
++	struct hk_inline_own *own;
++	struct hk_inline_own *ent;
++
++	mutex_lock(&g_inline_lock);
++	list_for_each_entry(ent, &g_inline_owned, list) {
++		if (ent->hook != h)
++			continue;
++		pr_warn("[lkmhook] inline %s already installed\n", sym);
++		mutex_unlock(&g_inline_lock);
++		return -EBUSY;
++	}
++	other = hk_inline_overlap(start, len);
++	if (other) {
++		hk_inline_report("inline", sym, start, len, other);
++		mutex_unlock(&g_inline_lock);
++		return -EBUSY;
++	}
++
++	own = kzalloc(sizeof(*own), GFP_KERNEL);
++	if (!own) {
++		mutex_unlock(&g_inline_lock);
++		return -ENOMEM;
++	}
++	own->hook = h;
++	own->start = start;
++	own->len = len;
++	list_add(&own->list, &g_inline_owned);
++	mutex_unlock(&g_inline_lock);
++	return 0;
++}
++
++/* hand the window back so a later install can take it */
++static void hk_inline_release(const struct hk_inline *h)
++{
++	struct hk_inline_own *ent;
++
++	mutex_lock(&g_inline_lock);
++	list_for_each_entry(ent, &g_inline_owned, list) {
++		if (ent->hook != h)
++			continue;
++		list_del(&ent->list);
++		mutex_unlock(&g_inline_lock);
++		kfree(ent);
++		return;
++	}
++	mutex_unlock(&g_inline_lock);
++}
++
++/* the probe half of the claim: name the live window that would refuse an install
++ * on [start, start + len), 0 when the range is free */
++static int hk_inline_collide(const char *sym, unsigned long start, u32 len,
++			     unsigned long *out)
++{
++	const struct hk_inline_own *other;
++
++	mutex_lock(&g_inline_lock);
++	other = hk_inline_overlap(start, len);
++	if (!other) {
++		mutex_unlock(&g_inline_lock);
++		return 0;
++	}
++	*out = other->start;
++	hk_inline_report("probe", sym, start, len, other);
++	mutex_unlock(&g_inline_lock);
++	return -EBUSY;
++}
++
++/*
++ * the page table entry of a kernel virtual address. the walk is the generic one
++ * and it is handed the kernel's own init_mm, resolved at runtime because the
++ * symbol is not in the module namespace of every build. a block mapping at any
++ * level means the page has no pte this code could change, which is a refused
++ * guard rather than a written entry
++ */
++static unsigned long *hk_pte_of(unsigned long addr)
++{
++	struct mm_struct *mm;
++	pgd_t *pgd;
++	p4d_t *p4d;
++	pud_t *pud;
++	pmd_t *pmd;
++
++	mm = (struct mm_struct *)hk_resolve("init_mm");
++	if (!mm || !hk_ker_addr_ok((unsigned long)mm))
++		return NULL;
++	pgd = pgd_offset(mm, addr);
++	if (pgd_none(*pgd) || pgd_bad(*pgd))
++		return NULL;
++	p4d = p4d_offset(pgd, addr);
++	if (p4d_none(*p4d) || p4d_bad(*p4d))
++		return NULL;
++	pud = pud_offset(p4d, addr);
++	if (pud_none(*pud) || pud_bad(*pud))
++		return NULL;
++	pmd = pmd_offset(pud, addr);
++	if (pmd_none(*pmd) || pmd_bad(*pmd))
++		return NULL;
++	return (unsigned long *)pte_offset_kernel(pmd, addr);
++}
++
++/*
++ * an entry shorter than the window: a ret, a br or an unconditional branch ends the
++ * function, so the instructions after it belong to whatever the linker put next.
++ * copying those into a trampoline and jumping back into the middle of them is what
++ * a short function cannot survive, so the window is judged before anything is
++ * written and the caller is told to take the breakpoint route instead
++ */
++static int hk_inline_short(const u32 *win, unsigned int words)
++{
++	unsigned int i;
++
++	for (i = 0; i < words; i++) {
++		bool ret = (win[i] & 0xFFFFFC1F) == 0xD65F0000;
++		bool br = (win[i] & 0xFFFFFC1F) == 0xD61F0000;
++		bool b = (win[i] & 0xFC000000) == 0x14000000;
++
++		if ((ret || br || b) && i + 1 < words)
++			return -EOPNOTSUPP;
++	}
++	return 0;
++}
++
++
++/*
++ * the continuation of every relocated branch is an indirect branch, and an
++ * indirect branch into a page whose pte carries the guarded attribute traps
++ * unless the first instruction is a bti landing pad. the resumption points are
++ * the instructions after the patched window, which are not landing pads, so the
++ * attribute is cleared for exactly the pages that hold one and recorded for the
++ * free path to put back. the attribute is not cleared on the entry page, a
++ * caller that reaches the entry indirectly needs the landing pad there
++ */
++static int hk_bti_guard_track(struct hk_inline *h, unsigned long addr)
++{
++	struct hk_inline_guard *guard;
++	unsigned long page = addr & PAGE_MASK;
++	unsigned long *ptep;
++	unsigned long pte;
++	u32 i;
++
++	for (i = 0; i < h->guard_count; i++) {
++		if (h->guard[i].page == page)
++			return 0;
++	}
++	if (h->guard_count >= HK_INLINE_GUARD_MAX)
++		return -ENOSPC;
++	ptep = hk_pte_of(page);
++	if (!ptep)
++		return -EFAULT;
++	pte = READ_ONCE(*ptep);
++	if (!HK_BTI_GUARDED(pte))
++		return 0;
++
++	guard = &h->guard[h->guard_count++];
++	guard->page = page;
++	guard->ptep = ptep;
++	guard->pte = pte;
++	guard->had_gp = true;
++	guard->active = true;
++	/*
++	 * the guarded bit is part of the translation, so the entry alone is not
++	 * enough: without the invalidation a cpu keeps the old translation and the
++	 * branch back into the middle of the function still trips BTI
++	 */
++	WRITE_ONCE(*ptep, pte & ~HK_PTE_GP);
++	__flush_tlb_kernel_pgtable(page);
++	dsb(ish);
++	isb();
++	if (READ_ONCE(*ptep) & HK_PTE_GP) {
++		/* the bit cannot be taken away here, so the hook must not be set up */
++		WRITE_ONCE(*ptep, pte);
++		__flush_tlb_kernel_pgtable(page);
++		dsb(ish);
++		isb();
++		guard->active = false;
++		h->guard_count--;
++		return -EFAULT;
++	}
++	return 0;
++}
++
++static void hk_bti_guard_restore(struct hk_inline *h)
++{
++	unsigned long *ptep;
++	u32 i;
++
++	for (i = 0; i < h->guard_count; i++) {
++		if (!h->guard[i].active)
++			continue;
++		ptep = h->guard[i].ptep;
++		if (!ptep)
++			continue;
++		WRITE_ONCE(*ptep, h->guard[i].pte);
++		__flush_tlb_kernel_pgtable(h->guard[i].page);
++		dsb(ish);
++		isb();
++		h->guard[i].active = false;
++	}
++	h->guard_count = 0;
++}
++
++static __nocfi int hk_inline_apply(struct hk_inline *h, const char *sym,
++				   unsigned long wrapper, unsigned long addr)
++{
++	struct hk_relo_ctx ctx;
++	u32 *tramp;
++	u32 detour[HK_INLINE_ENTRY_MAX];
++	unsigned long mem;
++	u32 saved[HK_INLINE_ENTRY_MAX];
++	u32 i;
++	int ret;
++
++	memset(h, 0, sizeof(*h));
++	tramp = kzalloc(HK_TRAMP_STAGE_WORDS * 4, GFP_KERNEL);
++	if (!tramp)
++		return -ENOMEM;
++
++	if (!wrapper || !hk_ker_addr_ok(wrapper)) {
++		pr_warn("[lkmhook] inline %s has no usable wrapper\n", sym);
++		return -EINVAL;
++	}
++
++	/*
++	 * the window is read once through the nofault helper and every later step
++	 * uses the copy, the entry can be restored to its own bytes by a failed
++	 * install after this point and the relocation must not read the patched
++	 * text again
++	 */
++	for (i = 0; i < HK_INLINE_ENTRY_MAX; i++) {
++		ret = hk_fetch_insn(addr + i * 4, &saved[i]);
++		if (ret) {
++			pr_warn("[lkmhook] inline %s entry is not readable\n",
++				sym);
++			ret = -EFAULT;
++			goto err_free;
++		}
++		h->saved[i * 4] = saved[i] & 0xFF;
++		h->saved[i * 4 + 1] = (saved[i] >> 8) & 0xFF;
++		h->saved[i * 4 + 2] = (saved[i] >> 16) & 0xFF;
++		h->saved[i * 4 + 3] = (saved[i] >> 24) & 0xFF;
++	}
++	ret = hk_inline_short(saved, HK_INLINE_ENTRY_MAX);
++	if (ret) {
++		pr_warn("[lkmhook] inline %s is shorter than the window, breakpoint route\n",
++			sym);
++		goto err_free;
++	}
++
++	mem = (unsigned long)hk_exec_alloc(HK_TRAMP_SIZE);
++	if (!mem) {
++		pr_warn("[lkmhook] inline exec alloc %s failed\n", sym);
++		ret = -ENOMEM;
++		goto err_free;
++	}
++	h->mem = (void *)mem;
++	h->mem_size = HK_TRAMP_SIZE;
++	h->addr = addr;
++	h->window = HK_INLINE_PATCH_LEN;
++	h->name = sym;
++
++	tramp[0] = HK_INS_BTI_JC;
++	tramp[1] = HK_INS_LDR_X17;
++	tramp[2] = HK_INS_RET_X17;
++	tramp[3] = wrapper & 0xFFFFFFFF;
++	tramp[4] = wrapper >> 32;
++	tramp[5] = HK_INS_BTI_JC;
++
++	memset(&ctx, 0, sizeof(ctx));
++	ctx.dst = tramp + 6;
++	ctx.src = h->saved;
++	ctx.tramp_start = addr;
++	ctx.tramp_end = addr + HK_INLINE_PATCH_LEN;
++	ctx.backup_start = mem + 24;
++
++	for (i = 0; i < HK_INLINE_ENTRY_MAX; i++) {
++		ctx.inst_addr = addr + i * 4;
++		ret = hk_relo_inst(&ctx, saved[i]);
++		if (ret) {
++			pr_warn("[lkmhook] inline relo %s insn %u refused %d\n",
++				sym, i, ret);
++			goto err_guard;
++		}
++	}
++
++	/*
++	 * the continuation is the instruction after the window. it is reached with
++	 * an indirect branch, so the page is guarded and the landing pad rule
++	 * applies: br x17 stays when the attribute can be cleared, otherwise ret
++	 * x17 is used, which is a return and has no landing pad requirement
++	 */
++	ctx.inst_addr = addr + HK_INLINE_PATCH_LEN;
++	h->use_br_x17 = true;
++	if (hk_bti_guard_track(h, addr + HK_INLINE_PATCH_LEN))
++		h->use_br_x17 = false;
++	ret = hk_relo_stub(&ctx, addr + HK_INLINE_PATCH_LEN, h->use_br_x17);
++	if (ret)
++		goto err_guard;
++
++	ret = hk_engine_write((void *)mem, tramp, ctx.count * 4 + 24);
++	if (ret)
++		goto err_guard;
++
++	h->orig = mem + 20;
++
++	/*
++	 * the detour is written in one call, so a multi instruction window goes
++	 * through stop_machine: no core is running while the entry changes from
++	 * the caller's bytes to bti jc plus an absolute jump
++	 */
++	detour[0] = HK_INS_BTI_JC;
++	detour[1] = HK_INS_LDR_X17;
++	detour[2] = HK_INS_RET_X17;
++	detour[3] = mem & 0xFFFFFFFF;
++	detour[4] = mem >> 32;
++	ret = hk_engine_write((void *)addr, detour, HK_INLINE_PATCH_LEN);
++	if (ret) {
++		hk_engine_write((void *)addr, h->saved, HK_INLINE_PATCH_LEN);
++		goto err_guard;
++	}
++
++	kfree(tramp);
++	pr_info("[lkmhook] inline %s addr=0x%lx tramp=0x%lx words=%u br_x17=%u\n",
++		sym, addr, mem, ctx.count, h->use_br_x17 ? 1 : 0);
++	return 0;
++
++err_guard:
++	hk_bti_guard_restore(h);
++	hk_exec_free(h->mem);
++	h->mem = NULL;
++	pr_warn("[lkmhook] inline %s failed %d\n", sym, ret);
++err_free:
++	kfree(tramp);
++	return ret;
++}
++
++__nocfi int hk_inline_hook(struct hk_inline *h, const char *sym,
++			   const char *wrapper_sym)
++{
++	unsigned long wrapper = 0;
++	unsigned long addr = 0;
++	int ret;
++
++	if (!h || !sym || !wrapper_sym)
++		return -EINVAL;
++
++	/*
++	 * one lock across trampoline allocation, relocation and both text
++	 * writes, so two installs cannot interleave their trampolines or their
++	 * entry windows, and no trampoline is freed under a reader
++	 */
++	ret = hk_read_addr(sym, &addr);
++	if (ret) {
++		pr_warn("[lkmhook] inline resolve %s failed %d\n", sym, ret);
++		return -ENODATA;
++	}
++	ret = hk_inline_own(h, sym, addr, HK_INLINE_PATCH_LEN);
++	if (ret)
++		return ret;
++	wrapper = hk_resolve(wrapper_sym);
++	if (!wrapper) {
++		pr_warn("[lkmhook] inline resolve %s failed\n", wrapper_sym);
++		hk_inline_release(h);
++		return -ENODATA;
++	}
++	mutex_lock(&g_inline_lock);
++	ret = hk_inline_apply(h, sym, wrapper, addr);
++	mutex_unlock(&g_inline_lock);
++	if (ret)
++		hk_inline_release(h);
++	return ret;
++}
++
++/*
++ * [ADAPTER] 地址版入口。
++ *
++ * 原 hk_inline_hook() 自己按符号名解析目标和 wrapper；lkm4ctr 的 shadow_hook
++ * 早就解析好了地址（还能在多个候选名之间回退），wrapper 是模块内静态函数，
++ * 名字不一定在 kallsyms 里。所以这里直接收两个地址，跳过解析。
++ */
++__nocfi int hk_inline_hook_addr(struct hk_inline *h, const char *name,
++				unsigned long addr, unsigned long wrapper)
++{
++	int ret;
++
++	if (!h || !name || !addr || !wrapper)
++		return -EINVAL;
++
++	ret = hk_inline_own(h, name, addr, HK_INLINE_PATCH_LEN);
++	if (ret)
++		return ret;
++	mutex_lock(&g_inline_lock);
++	ret = hk_inline_apply(h, name, wrapper, addr);
++	mutex_unlock(&g_inline_lock);
++	if (ret)
++		hk_inline_release(h);
++	return ret;
++}
++
++int hk_inline_disable(struct hk_inline *h)
++{
++	/* the restore is a text write too, keep it off a concurrent install */
++	mutex_lock(&g_inline_lock);
++	if (!h || !h->addr) {
++		mutex_unlock(&g_inline_lock);
++		return -EINVAL;
++	}
++	if (h->disabled) {
++		mutex_unlock(&g_inline_lock);
++		return 0;
++	}
++	if (hk_engine_write((void *)h->addr, h->saved, HK_INLINE_PATCH_LEN)) {
++		mutex_unlock(&g_inline_lock);
++		return -EIO;
++	}
++	h->disabled = true;
++	mutex_unlock(&g_inline_lock);
++
++	/* the entry is the caller's bytes again, the window is up for grabs */
++	hk_inline_release(h);
++	return 0;
++}
++
++/*
++ * free the trampoline. the entry must be the caller's bytes again and the
++ * guarded pages go back to what they were. a hook that never reached disable is
++ * refused, its detour is still the entry
++ */
++void hk_inline_free(struct hk_inline *h)
++{
++	mutex_lock(&g_inline_lock);
++	if (!h) {
++		mutex_unlock(&g_inline_lock);
++		return;
++	}
++	if (h->addr && !h->disabled) {
++		mutex_unlock(&g_inline_lock);
++		/*
++		 * freeing before the disable is a programmer error: the detour is
++		 * still the entry, so the free is refused and the trampoline stays.
++		 * the notice is what a caller that wants to know about it reads
++		 */
++		hk_notice(HK_NOTICE_FREE_BEFORE_DISABLE,
++			  h->name ? h->name : "unnamed hook");
++		return;
++	}
++	hk_bti_guard_restore(h);
++	if (h->mem)
++		hk_exec_free(h->mem);
++	h->addr = 0;
++	h->orig = 0;
++	h->mem = NULL;
++	h->disabled = false;
++	mutex_unlock(&g_inline_lock);
++
++	/*
++	 * hk_inline_disable already handed the window back, this is the release
++	 * for a hook that never reached disable. the node keeps no bytes, the
++	 * entry still carries the last detour, so a claim taken here covers
++	 * bytes the caller has to restore itself
++	 */
++	hk_inline_release(h);
++}
++
++static void hk_inline_pending_add(struct hk_inline *h)
++{
++	struct hk_inline_pending *ent;
++
++	mutex_lock(&g_inline_lock);
++	list_for_each_entry(ent, &g_inline_pending, list) {
++		if (ent->hook == h) {
++			mutex_unlock(&g_inline_lock);
++			return;
++		}
++	}
++	ent = kzalloc(sizeof(*ent), GFP_KERNEL);
++	if (!ent) {
++		mutex_unlock(&g_inline_lock);
++		return;
++	}
++	ent->hook = h;
++	list_add(&ent->list, &g_inline_pending);
++	mutex_unlock(&g_inline_lock);
++}
++
++static void hk_inline_pending_del(struct hk_inline *h)
++{
++	struct hk_inline_pending *ent;
++
++	mutex_lock(&g_inline_lock);
++	list_for_each_entry(ent, &g_inline_pending, list) {
++		if (ent->hook != h)
++			continue;
++		list_del(&ent->list);
++		mutex_unlock(&g_inline_lock);
++		kfree(ent);
++		return;
++	}
++	mutex_unlock(&g_inline_lock);
++}
++
++/*
++ * the three stage unload. disable first, so no core can fetch the detour again.
++ * then one tasks RCU grace period, which is what waits for a core that already
++ * fetched the detour and is inside the trampoline, the kernel uses the same
++ * flavour for its own text pokes. the free comes last, after both. a hook whose
++ * entry could not be restored stays live and pending for hk_inline_exit
++ */
++void hk_inline_unhook(struct hk_inline *h)
++{
++	if (!h)
++		return;
++	if (hk_inline_disable(h)) {
++		h->pending = true;
++		hk_inline_pending_add(h);
++		pr_warn("[lkmhook] inline unhook %s parked, the entry is still patched\n",
++			h->name ? h->name : "?");
++		return;
++	}
++	hk_wait_tasks_rcu();
++	hk_inline_free(h);
++	h->pending = false;
++	hk_inline_pending_del(h);
++}
++
++unsigned int hk_inline_pending(void)
++{
++	unsigned int count = 0;
++	struct hk_inline_pending *ent;
++
++	mutex_lock(&g_inline_lock);
++	list_for_each_entry(ent, &g_inline_pending, list)
++		count++;
++	mutex_unlock(&g_inline_lock);
++	return count;
++}
++
++void hk_inline_exit(void)
++{
++	struct hk_inline_pending *ent;
++	struct hk_inline_pending *tmp;
++	LIST_HEAD(work);
++
++	mutex_lock(&g_inline_lock);
++	list_splice_init(&g_inline_pending, &work);
++	mutex_unlock(&g_inline_lock);
++
++	list_for_each_entry_safe(ent, tmp, &work, list) {
++		list_del(&ent->list);
++		if (hk_inline_disable(ent->hook)) {
++			pr_warn("[lkmhook] inline %s still patched\n",
++				ent->hook->name ? ent->hook->name : "?");
++			list_add(&ent->list, &work);
++			continue;
++		}
++		hk_wait_tasks_rcu();
++		hk_inline_free(ent->hook);
++		ent->hook->pending = false;
++		kfree(ent);
++	}
++
++	mutex_lock(&g_inline_lock);
++	list_splice_tail(&work, &g_inline_pending);
++	mutex_unlock(&g_inline_lock);
++}
++
++/* the same walk as hk_resolve_branch_chain, which reads the target directly.
++ * a thunk is a supported hook target, here it is a report */
++static __nocfi int hk_follow_branch(unsigned long addr, unsigned long *out)
++{
++	return hk_resolve_branch_chain(addr, out);
++}
++
++static __nocfi bool hk_is_br(u32 insn)
++{
++	return (insn & HK_INS_BR_MASK) == HK_INS_BR_ANY;
++}
++
++static __nocfi bool hk_is_brk(u32 insn)
++{
++	return (insn & HK_INS_BRK_MASK) == HK_INS_BRK_ANY;
++}
++
++/* hint space, wider than hk_is_hint: bti is outside that mask and the detour
++ * this library writes leads with bti jc */
++static __nocfi bool hk_is_pad(u32 insn)
++{
++	return (insn & 0xFFFFF01F) == 0xD503201F;
++}
++
++/* br carries its register in rn, the literal loads and the moves in rd */
++static __nocfi u32 hk_stub_rn(u32 insn)
++{
++	return (insn >> 5) & 0x1F;
++}
++
++static __nocfi u32 hk_stub_rd(u32 insn)
++{
++	return insn & 0x1F;
++}
++
++/*
++ * exact stubs only. the relocation tables leave br, brk, movz and movk out, so
++ * they are spelled out here, and anything else has to stay plain: a stub that
++ * passes for a prologue is the answer a caller cannot recover from
++ */
++static __nocfi enum hk_inline_state hk_stub_state(const u32 *win,
++						  const char **reason)
++{
++	const u32 *s = win;
++	int left = HK_INLINE_ENTRY_MAX;
++	u32 rd;
++	int i;
++
++	/* the ftrace preamble, every instrumented entry carries it, and a live
++	 * one is patched to a bl that a detour would sit on top of */
++	if (win[0] == HK_INS_MOV_X9_LR) {
++		*reason = hk_insn_type(win[1]) == HK_INST_BL ?
++			  "ftrace call site at entry" : "ftrace patch site at entry";
++		return HK_INLINE_PATCHSITE;
++	}
++	if (hk_is_pad(win[0])) {
++		s++;
++		left--;
++	}
++	rd = hk_stub_rd(s[0]);
++	if (hk_is_br(s[0])) {
++		*reason = "br at entry";
++		return HK_INLINE_HOOKED;
++	}
++	if (hk_is_brk(s[0])) {
++		*reason = "brk at entry";
++		return HK_INLINE_HOOKED;
++	}
++	/* a b behind a pad the branch walk does not cross, bti is outside
++	 * hk_is_hint, so the hook would patch this entry and not its target */
++	if (hk_is_b(s[0])) {
++		*reason = "direct b at entry";
++		return HK_INLINE_BRANCHED;
++	}
++	if (hk_insn_type(s[0]) == HK_INST_LDR_64 && hk_is_br(s[1]) &&
++	    hk_stub_rn(s[1]) == rd) {
++		*reason = "ldr br stub at entry";
++		return HK_INLINE_HOOKED;
++	}
++	if ((s[0] & HK_INS_MOV_MASK) == HK_INS_MOVZ) {
++		for (i = 1; i < left; i++) {
++			if (hk_is_br(s[i]) && hk_stub_rn(s[i]) == rd) {
++				*reason = "movz br stub at entry";
++				return HK_INLINE_HOOKED;
++			}
++			if ((s[i] & HK_INS_MOV_MASK) != HK_INS_MOVK ||
++			    hk_stub_rd(s[i]) != rd)
++				break;
++		}
++	}
++	return HK_INLINE_PLAIN;
++}
++
++__nocfi int hk_inline_probe(const char *sym, struct hk_inline_probe *out)
++{
++	struct hk_relo_ctx ctx;
++	u8 raw[HK_INLINE_PATCH_LEN];
++	u32 win[HK_INLINE_ENTRY_MAX];
++	u32 scratch[HK_PROBE_SCRATCH];
++	unsigned long addr;
++	unsigned long target;
++	u32 i;
++	int ret;
++
++	if (!sym || !out)
++		return -EINVAL;
++	memset(out, 0, sizeof(*out));
++	out->patch_len = HK_INLINE_PATCH_LEN;
++	out->state = HK_INLINE_UNRESOLVED;
++	out->reason = "symbol not resolved";
++
++	addr = hk_resolve(sym);
++	if (!addr)
++		return 0;
++	if (!hk_ker_addr_ok(addr)) {
++		out->state = HK_INLINE_UNSUPPORTED;
++		out->reason = "not a kernel address";
++		return 0;
++	}
++	out->addr = addr;
++
++	if (hk_follow_branch(addr, &target)) {
++		out->state = HK_INLINE_UNREADABLE;
++		out->reason = "entry not readable";
++		return 0;
++	}
++	if (!hk_ker_addr_ok(target)) {
++		out->state = HK_INLINE_UNSUPPORTED;
++		out->reason = "not a kernel address";
++		return 0;
++	}
++	out->target = target;
++
++	/* the entry is not judged further, an install onto it is refused */
++	if (hk_inline_collide(sym, target, HK_INLINE_PATCH_LEN,
++			      &out->collide_addr)) {
++		out->state = HK_INLINE_COLLISION;
++		out->reason = "window owned by a live hook";
++		return 0;
++	}
++
++	if (hk_read_code(target, raw, sizeof(raw))) {
++		out->state = HK_INLINE_UNREADABLE;
++		out->reason = "entry not readable";
++		return 0;
++	}
++	for (i = 0; i < HK_INLINE_ENTRY_MAX; i++)
++		win[i] = hk_get_insn(raw + i * 4);
++
++	out->state = hk_stub_state(win, &out->reason);
++	if (out->state != HK_INLINE_PLAIN)
++		return 0;
++
++	/* dry run the relocator over the copy, scratch is never patched and
++	 * never mapped executable, only the refusal is of interest */
++	memset(&ctx, 0, sizeof(ctx));
++	ctx.dst = scratch;
++	ctx.src = raw;
++	ctx.tramp_start = target;
++	ctx.tramp_end = target + HK_INLINE_PATCH_LEN;
++	for (i = 0; i < HK_INLINE_ENTRY_MAX; i++) {
++		ctx.inst_addr = target + i * 4;
++		ret = hk_relo_inst(&ctx, win[i]);
++		if (ret) {
++			out->state = HK_INLINE_UNSUPPORTED;
++			out->reason = "entry operand points into the patched window";
++			return 0;
++		}
++	}
++
++	if (target != addr) {
++		out->state = HK_INLINE_BRANCHED;
++		out->reason = "direct b at entry";
++		return 0;
++	}
++	out->state = HK_INLINE_PLAIN;
++	out->reason = "no branch stub found";
++	return 0;
++}
+diff --git a/glue/hk/hk_inline.h b/glue/hk/hk_inline.h
+new file mode 100644
+index 0000000..cdc5e12
+--- /dev/null
++++ b/glue/hk/hk_inline.h
+@@ -0,0 +1,145 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2026 dere3046
++ */
++
++#ifndef LKMHOOK_HK_INLINE_H
++#define LKMHOOK_HK_INLINE_H
++
++#include <linux/types.h>
++
++#define HK_INLINE_ENTRY_MAX 5
++
++/* bytes the detour overwrites at the entry, the exposure hk_inline_probe reports */
++#define HK_INLINE_PATCH_LEN (HK_INLINE_ENTRY_MAX * 4)
++
++/* pages whose BTI guarded attribute is cleared for a BR X17 continuation */
++#define HK_INLINE_GUARD_MAX 8
++
++struct hk_inline_guard {
++	unsigned long page;
++	unsigned long *ptep;	/* the entry itself, the value alone is not writable */
++	unsigned long pte;	/* what the entry held before the bit was cleared */
++	bool had_gp;
++	bool active;
++};
++
++struct hk_inline {
++	const char *name;
++	unsigned long addr;
++	unsigned long orig;
++	void *mem;
++	size_t mem_size;
++	u32 window;
++	bool disabled;
++	bool pending;
++	bool use_br_x17;
++	struct hk_inline_guard guard[HK_INLINE_GUARD_MAX];
++	u32 guard_count;
++	u8 saved[HK_INLINE_ENTRY_MAX * 4];
++};
++
++/*
++ * installs are serialized by a mutex held across trampoline allocation, relocation
++ * and the text writes, so two hooks cannot interleave and a restore cannot run inside
++ * an install. the write itself is still not atomic: the detour is several instructions
++ * long, its length is reported by the p3 count line at install time, so a core that
++ * executes the target while the write happens can run a half written instruction stream
++ * the lock takes the second writer out, not the reader
++ *
++ * a target that is executing during installation, a device_add style hot path, is
++ * therefore still not safe to hook. use the kprobe entries there. the entry window is
++ * written with one call, so a multi instruction detour is written from a stop_machine
++ * callback and only a single word goes through the direct path
++ *
++ * the detour covers HK_INLINE_PATCH_LEN bytes from the entry, so a target whose symbol is
++ * shorter than that shares its window with the next function. the library records the
++ * window of every live hook and refuses an install that overlaps one, -EBUSY names both
++ * symbols, hk_inline_probe reports the length it would write and the same collision
++ */
++int hk_inline_hook(struct hk_inline *h, const char *sym,
++		   const char *wrapper_sym);
++int hk_inline_hook_addr(struct hk_inline *h, const char *name,
++			unsigned long addr, unsigned long wrapper);
++/* restore the entry, -EIO when the write fails and the hook stays live. the
++ * window is released with the restore, a later install may take it */
++int hk_inline_disable(struct hk_inline *h);
++void hk_inline_free(struct hk_inline *h);
++
++/*
++ * reconcile the relocator's length table with the emitters that write the
++ * trampoline. the library never runs it by itself: an emitter and the table are
++ * written next to each other, and a build that wants them proven calls this. it
++ * allocates nothing and does not sleep, 0 when every class agrees, -EIO when one
++ * does not, and the notice names the class
++ */
++int hk_relo_check(void);
++/*
++ * the three stage unload: disable the entry, wait one RCU tasks grace period so
++ * a core that already fetched the detour is out of the trampoline, then free it.
++ * a hook whose entry could not be restored stays live and pending, and
++ * hk_inline_exit retries it
++ */
++void hk_inline_unhook(struct hk_inline *h);
++
++/*
++ * what a consumer compiles in is its own build decision. setting the flag leaves
++ * this module out of the link, and the calls the core makes into it become
++ * nothing, while the entry points of the module itself stay declared: calling one
++ * of those without its object is a link error, never a silent no op
++ */
++#ifdef HK_NO_INLINE
++static inline void hk_inline_exit(void) { }
++static inline unsigned int hk_inline_pending(void) { return 0; }
++#else
++void hk_inline_exit(void);
++unsigned int hk_inline_pending(void);
++#endif
++
++
++/*
++ * what the entry of a probe target looks like from the outside. everything
++ * except plain means the window should not be patched as it stands
++ */
++enum hk_inline_state {
++	HK_INLINE_UNRESOLVED = 0,	/* the symbol did not resolve */
++	HK_INLINE_UNREADABLE,		/* the entry window could not be read */
++	HK_INLINE_UNSUPPORTED,		/* the relocator refuses the window */
++	HK_INLINE_HOOKED,		/* a branch stub sits in the window */
++	HK_INLINE_PATCHSITE,		/* an ftrace patch site, the entry is live */
++	HK_INLINE_BRANCHED,		/* a direct b in the entry, see target */
++	HK_INLINE_PLAIN,		/* no known stub, relocator accepts */
++	HK_INLINE_COLLISION,		/* a live hook owns part of the window */
++};
++
++struct hk_inline_probe {
++	unsigned long addr;	/* resolver result, 0 when unresolved */
++	unsigned long target;	/* entry a hook would patch, branch chain followed */
++	u32 patch_len;		/* bytes the detour overwrites there, HK_INLINE_PATCH_LEN */
++	enum hk_inline_state state;
++	const char *reason;	/* static string, the caller never owns it */
++	unsigned long collide_addr;	/* start of the window in the way, 0 when free */
++};
++
++/*
++ * read only half of hk_inline_hook: resolve the symbol, follow the same branch
++ * chain, read the entry window through the nofault helper and run the relocator
++ * over a copy of it. nothing is written, nothing is allocated and it does not
++ * sleep, so a live hot path can be judged before it is patched.
++ *
++ * the prologue answer is signature based. a known stub comes back hooked, an
++ * ftrace patch site comes back patchsite, a direct b comes back branched, and
++ * target is the entry a hook would write to: the end of the branch chain when
++ * the entry is a thunk the library follows, the entry itself otherwise. an adrp
++ * add br stub and a patch that leaves the first instructions alone are not
++ * recognised, so plain means no known stub was found, it is not proof of an
++ * untouched prologue.
++ *
++ * collision means another live hook owns part of the window, the install would
++ * return -EBUSY, and collide_addr is the start of that window. the probe reads
++ * the installed window table, a hook installed after the probe is not in it
++ *
++ * 0 when the report was filled, -EINVAL on a NULL argument.
++ */
++int hk_inline_probe(const char *sym, struct hk_inline_probe *out);
++#endif
+diff --git a/glue/hk/hk_kprobe.c b/glue/hk/hk_kprobe.c
+new file mode 100644
+index 0000000..a1a0f4a
+--- /dev/null
++++ b/glue/hk/hk_kprobe.c
+@@ -0,0 +1,423 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2026 dere3046
++ */
++
++#include <linux/errno.h>
++#include <linux/kprobes.h>
++#include <linux/list.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/printk.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/string.h>
++#include <linux/types.h>
++
++#include "hk.h"
++#include "hk_kprobe.h"
++
++typedef int (*register_kprobe_fn)(struct kprobe *p);
++typedef void (*unregister_kprobe_fn)(struct kprobe *p);
++typedef bool (*within_blacklist_fn)(unsigned long addr);
++typedef int (*core_text_fn)(unsigned long addr);
++typedef bool (*module_text_fn)(unsigned long addr);
++typedef unsigned long (*ftrace_location_fn)(unsigned long ip);
++
++/* one tracking node per live probe, the list has no ceiling */
++struct hk_kprobe_node {
++	struct list_head list;
++	struct hk_kprobe *hook;
++};
++
++static LIST_HEAD(g_kprobes);
++static DEFINE_SPINLOCK(g_kprobe_lock);
++
++/* a probe that unregister_kprobe cannot take back keeps reaching into this module */
++static unsigned int g_kprobe_stuck;
++
++struct hk_blacklist_saved {
++	struct kprobe_blacklist_entry *entry;
++	unsigned long start_addr;
++	unsigned long end_addr;
++};
++
++static struct hk_blacklist_saved *g_blacklist_saved;
++static size_t g_blacklist_count;
++static bool g_blacklist_cleared;
++static DEFINE_MUTEX(g_blacklist_lock);
++
++static __nocfi int call_register_kprobe(struct kprobe *p)
++{
++	register_kprobe_fn fn;
++
++	fn = (register_kprobe_fn)hk_resolve("register_kprobe");
++	if (!fn)
++		return -ENODATA;
++	return fn(p);
++}
++
++static __nocfi int call_unregister_kprobe(struct kprobe *p)
++{
++	unregister_kprobe_fn fn;
++
++	fn = (unregister_kprobe_fn)hk_resolve("unregister_kprobe");
++	if (!fn)
++		return -ENODATA;
++	fn(p);
++	return 0;
++}
++
++static __nocfi bool call_within_blacklist(unsigned long addr)
++{
++	within_blacklist_fn fn;
++
++	fn = (within_blacklist_fn)hk_resolve("within_kprobe_blacklist");
++	return fn ? fn(addr) : false;
++}
++
++static __nocfi bool call_core_text(unsigned long addr)
++{
++	core_text_fn fn;
++
++	fn = (core_text_fn)hk_resolve("core_kernel_text");
++	if (!fn)
++		return hk_ker_addr_ok(addr);
++	return fn(addr);
++}
++
++static __nocfi bool call_module_text(unsigned long addr)
++{
++	module_text_fn fn;
++
++	fn = (module_text_fn)hk_resolve("is_module_text_address");
++	return fn ? fn(addr) : false;
++}
++
++/* the kernel takes core kernel text or module text, a rodata symbol is refused */
++static __nocfi bool call_text_addr(unsigned long addr)
++{
++	return call_core_text(addr) || call_module_text(addr);
++}
++
++static __nocfi unsigned long call_ftrace_location(unsigned long addr)
++{
++	ftrace_location_fn fn;
++
++	fn = (ftrace_location_fn)hk_resolve("ftrace_location");
++	return fn ? fn(addr) : 0;
++}
++
++/*
++ * the address gates of register_kprobe in its own order. every one of them
++ * comes back as -EINVAL, so the caller has to be told which one fired
++ */
++static __nocfi enum hk_kprobe_state hk_kprobe_gate_addr(unsigned long a,
++							const char **reason)
++{
++	if (!call_text_addr(a)) {
++		*reason = "not kernel text";
++		return HK_KPROBE_UNSUPPORTED;
++	}
++	if (call_within_blacklist(a)) {
++		*reason = "kprobe blacklist, clear with hk_kprobe_clear_blacklist";
++		return HK_KPROBE_BLACKLISTED;
++	}
++#ifndef CONFIG_KPROBES_ON_FTRACE
++	/* arm64 never selects it, there a recorded call site is refused */
++	if (call_ftrace_location(a) == a) {
++		*reason = "ftrace call site";
++		return HK_KPROBE_PATCHSITE;
++	}
++#endif
++	*reason = "no address gate matched";
++	return HK_KPROBE_OK;
++}
++
++static __nocfi enum hk_kprobe_state hk_kprobe_gate(const char *sym,
++						   unsigned long *addr,
++						   const char **reason)
++{
++	unsigned long a;
++
++	a = *sym ? hk_resolve(sym) : 0;
++	if (!a) {
++		*addr = 0;
++		*reason = "symbol not resolved";
++		return HK_KPROBE_UNRESOLVED;
++	}
++	*addr = a;
++
++	if (str_has_prefix(sym, "__cfi_") || str_has_prefix(sym, "__pfx_")) {
++		*reason = "cfi preamble symbol";
++		return HK_KPROBE_UNSUPPORTED;
++	}
++	return hk_kprobe_gate_addr(a, reason);
++}
++
++int hk_kprobe_check(const char *sym, struct hk_kprobe_report *out)
++{
++	if (!sym || !out)
++		return -EINVAL;
++
++	memset(out, 0, sizeof(*out));
++	out->state = hk_kprobe_gate(sym, &out->addr, &out->reason);
++	return 0;
++}
++
++int hk_kprobe_check_at(unsigned long addr, struct hk_kprobe_report *out)
++{
++	if (!addr || !out)
++		return -EINVAL;
++
++	memset(out, 0, sizeof(*out));
++	out->addr = addr;
++	out->state = hk_kprobe_gate_addr(addr, &out->reason);
++	return 0;
++}
++
++/* an address and a symbol read the same in a log, one of them is just longer */
++static void hk_kprobe_label(const struct hk_kprobe *h, char *buf, size_t len)
++{
++	if (h->kp.symbol_name)
++		strscpy(buf, h->kp.symbol_name, len);
++	else
++		snprintf(buf, len, "0x%lx", (unsigned long)h->kp.addr);
++}
++
++/* a refused install names the symbol and the gate, never a bare errno */
++static void hk_kprobe_fail(const char *label, int ret,
++			   const struct hk_kprobe_report *rep)
++{
++	pr_warn("[lkmhook] kprobe %s failed %d %s\n", label, ret, rep->reason);
++}
++
++/*
++ * the gate is asked only after the kernel refused, so a successful install costs
++ * no resolver walk, and the label is the symbol for one route and the address for
++ * the other because that is all either of them has
++ */
++static void hk_kprobe_fail_route(const struct hk_kprobe *h, int ret)
++{
++	struct hk_kprobe_report rep;
++	char label[48];
++
++	hk_kprobe_label(h, label, sizeof(label));
++	if (h->kp.symbol_name) {
++		if (!hk_kprobe_check(h->kp.symbol_name, &rep))
++			hk_kprobe_fail(label, ret, &rep);
++		return;
++	}
++	if (!hk_kprobe_check_at((unsigned long)h->kp.addr, &rep))
++		hk_kprobe_fail(label, ret, &rep);
++}
++
++/* an unregistered probe on module text is a use after free, say so */
++static int hk_kprobe_drop(struct hk_kprobe *h)
++{
++	char label[48];
++
++	if (!call_unregister_kprobe(&h->kp))
++		return 0;
++
++	hk_kprobe_label(h, label, sizeof(label));
++	pr_warn("[lkmhook] kprobe %s left registered, unregister_kprobe unresolved\n",
++		label);
++	return -ENODATA;
++}
++
++/* allocate the node, register and track: the two installs differ in one field */
++static int hk_kprobe_add(struct hk_kprobe *h, unsigned long addr)
++{
++	struct hk_kprobe_node *node;
++	unsigned long flags;
++	char label[48];
++	int ret;
++
++	node = kzalloc(sizeof(*node), GFP_KERNEL);
++	if (!node) {
++		hk_kprobe_label(h, label, sizeof(label));
++		pr_warn("[lkmhook] kprobe %s failed -ENOMEM, no tracking node\n",
++			label);
++		return -ENOMEM;
++	}
++
++	ret = call_register_kprobe(&h->kp);
++	if (ret < 0) {
++		kfree(node);
++		hk_kprobe_fail_route(h, ret);
++		return ret;
++	}
++	h->orig = (unsigned long)h->kp.addr;
++	if (!h->orig)
++		h->orig = addr;
++
++	node->hook = h;
++	spin_lock_irqsave(&g_kprobe_lock, flags);
++	list_add(&node->list, &g_kprobes);
++	spin_unlock_irqrestore(&g_kprobe_lock, flags);
++
++	hk_kprobe_label(h, label, sizeof(label));
++	pr_info("[lkmhook] kprobe %s @ 0x%lx\n", label, h->orig);
++	return 0;
++}
++
++int hk_kprobe_install(struct hk_kprobe *h, const char *sym,
++		      kprobe_pre_handler_t pre)
++{
++	if (!h || !sym || !pre)
++		return -EINVAL;
++
++	memset(h, 0, sizeof(*h));
++	h->kp.symbol_name = sym;
++	h->kp.pre_handler = pre;
++
++	return hk_kprobe_add(h, 0);
++}
++
++int hk_kprobe_install_at(struct hk_kprobe *h, unsigned long addr,
++			 kprobe_pre_handler_t pre)
++{
++	if (!h || !addr || !pre)
++		return -EINVAL;
++
++	memset(h, 0, sizeof(*h));
++	h->kp.addr = (kprobe_opcode_t *)addr;
++	h->kp.pre_handler = pre;
++
++	return hk_kprobe_add(h, addr);
++}
++
++int hk_kprobe_remove(struct hk_kprobe *h)
++{
++	struct hk_kprobe_node *node;
++	struct hk_kprobe_node *found = NULL;
++	unsigned long flags;
++
++	if (!h)
++		return -EINVAL;
++
++	spin_lock_irqsave(&g_kprobe_lock, flags);
++	list_for_each_entry(node, &g_kprobes, list) {
++		if (node->hook != h)
++			continue;
++		list_del(&node->list);
++		found = node;
++		break;
++	}
++	spin_unlock_irqrestore(&g_kprobe_lock, flags);
++
++	/* not tracked means not registered, a second remove is a no op */
++	if (!found)
++		return 0;
++
++	/* unregister sleeps, it stays outside the list lock */
++	kfree(found);
++	return hk_kprobe_drop(h);
++}
++
++int hk_kprobe_clear_blacklist(void)
++{
++	struct kprobe_blacklist_entry *ent;
++	struct list_head *head;
++	size_t count = 0;
++	size_t i = 0;
++
++	mutex_lock(&g_blacklist_lock);
++	if (g_blacklist_cleared) {
++		mutex_unlock(&g_blacklist_lock);
++		return 0;
++	}
++
++	head = (struct list_head *)hk_resolve("kprobe_blacklist");
++	if (!head || !hk_ker_addr_ok((unsigned long)head)) {
++		mutex_unlock(&g_blacklist_lock);
++		return -ENOENT;
++	}
++
++	list_for_each_entry(ent, head, list) {
++		if (ent->start_addr && ent->end_addr)
++			count++;
++	}
++
++	if (count) {
++		g_blacklist_saved = kcalloc(count, sizeof(*g_blacklist_saved),
++					    GFP_KERNEL);
++		if (!g_blacklist_saved) {
++			mutex_unlock(&g_blacklist_lock);
++			return -ENOMEM;
++		}
++	}
++
++	list_for_each_entry(ent, head, list) {
++		if (!ent->start_addr || !ent->end_addr)
++			continue;
++		g_blacklist_saved[i].entry = ent;
++		g_blacklist_saved[i].start_addr = ent->start_addr;
++		g_blacklist_saved[i].end_addr = ent->end_addr;
++		WRITE_ONCE(ent->start_addr, 0);
++		WRITE_ONCE(ent->end_addr, 0);
++		i++;
++	}
++
++	g_blacklist_count = count;
++	g_blacklist_cleared = true;
++	pr_info("[lkmhook] kprobe blacklist cleared %zu entries\n", count);
++	mutex_unlock(&g_blacklist_lock);
++	return 0;
++}
++
++void hk_kprobe_restore_blacklist(void)
++{
++	struct hk_blacklist_saved *s;
++	size_t i;
++
++	mutex_lock(&g_blacklist_lock);
++	if (!g_blacklist_cleared) {
++		mutex_unlock(&g_blacklist_lock);
++		return;
++	}
++
++	for (i = 0; i < g_blacklist_count; i++) {
++		s = &g_blacklist_saved[i];
++
++		if (!s->entry)
++			continue;
++		WRITE_ONCE(s->entry->start_addr, s->start_addr);
++		WRITE_ONCE(s->entry->end_addr, s->end_addr);
++	}
++
++	kfree(g_blacklist_saved);
++	g_blacklist_saved = NULL;
++	g_blacklist_count = 0;
++	g_blacklist_cleared = false;
++	pr_info("[lkmhook] kprobe blacklist restored\n");
++	mutex_unlock(&g_blacklist_lock);
++}
++
++void hk_kprobe_exit(void)
++{
++	struct hk_kprobe_node *node;
++	struct hk_kprobe_node *tmp;
++	LIST_HEAD(pending);
++	unsigned long flags;
++
++	/* take the list off the lock first, unregister sleeps */
++	spin_lock_irqsave(&g_kprobe_lock, flags);
++	list_splice_init(&g_kprobes, &pending);
++	spin_unlock_irqrestore(&g_kprobe_lock, flags);
++
++	list_for_each_entry_safe(node, tmp, &pending, list) {
++		if (hk_kprobe_drop(node->hook))
++			g_kprobe_stuck++;
++		list_del(&node->list);
++		kfree(node);
++	}
++
++	hk_kprobe_restore_blacklist();
++}
++
++unsigned int hk_kprobe_pending(void)
++{
++	return READ_ONCE(g_kprobe_stuck);
++}
+diff --git a/glue/hk/hk_kprobe.h b/glue/hk/hk_kprobe.h
+new file mode 100644
+index 0000000..8e8b069
+--- /dev/null
++++ b/glue/hk/hk_kprobe.h
+@@ -0,0 +1,209 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2026 dere3046
++ */
++
++#ifndef LKMHOOK_HK_KPROBE_H
++#define LKMHOOK_HK_KPROBE_H
++
++#include <linux/kprobes.h>
++#include <linux/types.h>
++
++struct hk_kprobe {
++	struct kprobe kp;
++	unsigned long orig;
++};
++
++/*
++ * use kprobe instead of hk_inline_hook when
++ *   the target can run on another core while the detour is written, a hot path
++ *   like device_add. register_kprobe arms the breakpoint under text_mutex and
++ *   cpus_read_lock, the inline primitive writes text with no such cover
++ *   the entry window holds an ftrace patch site, hk_inline_probe reports
++ *   HK_INLINE_PATCHSITE. the relocator would move a patched call site into the
++ *   trampoline and lose it, kprobe leaves the call site to ftrace
++ *   the relocator refuses the first instructions, hk_inline_probe reports
++ *   HK_INLINE_UNSUPPORTED
++ *
++ * the price is the handler contract: a probe observes a call, it does not
++ * replace the function. a pre handler runs at the entry with the arguments in
++ * regs, it can rewrite them, or return 1 and park the pc, see hk_regs_return
++ * below. the kernel does not step over the probed instruction by itself, so a
++ * handler that returns 1 has to move the pc itself. calling the target from a
++ * handler re-enters the same probe, so a full replacement stays an inline hook
++ * on a target other cores do not execute during installation
++ *
++ * every install is tracked in a list and removed again by hk_kprobe_exit, there
++ * is no ceiling on the number of live probes and no -ENOSPC. a refused install
++ * logs the symbol and the gate and returns the kernel code, -EINVAL for every
++ * address gate and -ENOENT for a symbol that does not resolve, -ENODATA when
++ * register_kprobe cannot be reached, -ENOMEM when the tracking node cannot be
++ * allocated, in which case nothing was registered
++ */
++int hk_kprobe_install(struct hk_kprobe *h, const char *sym,
++		      kprobe_pre_handler_t pre);
++/*
++ * the same for a target the caller holds as an address: a table entry it read
++ * itself, or a function whose name it does not want the resolver to see. addr has
++ * to be kernel or module text, which is the same gate the kernel asks, and every
++ * other gate, the count of live probes and the exit path are the ones above
++ */
++int hk_kprobe_install_at(struct hk_kprobe *h, unsigned long addr,
++			 kprobe_pre_handler_t pre);
++/*
++ * unregister and drop the tracking node, a second remove is a no op. 0 when the
++ * probe is gone, -ENODATA when unregister_kprobe cannot be reached and the probe
++ * is still armed, which is what a caller that owns the code behind it has to know
++ */
++int hk_kprobe_remove(struct hk_kprobe *h);
++/*
++ * what a consumer compiles in is its own build decision. setting the flag leaves
++ * this module out of the link, and the calls the core makes into it become
++ * nothing, while the entry points of the module itself stay declared: calling one
++ * of those without its object is a link error, never a silent no op
++ */
++#ifdef HK_NO_KPROBE
++static inline void hk_kprobe_exit(void) { }
++#else
++/* unregister every tracked probe, called by hk_exit */
++void hk_kprobe_exit(void);
++#endif
++/*
++ * probes the exit sweep could not take back, which are the ones whose handler is
++ * still reached from kernel text: a module that owns such a probe must not be
++ * unmapped, and this is what hk_exit_block counts. a remove the caller runs itself
++ * answers the same question in its return value and does not add to this
++ */
++/*
++ * what a consumer compiles in is its own build decision. setting the flag leaves
++ * this module out of the link, and the calls the core makes into it become
++ * nothing, while the entry points of the module itself stay declared: calling one
++ * of those without its object is a link error, never a silent no op
++ */
++#ifdef HK_NO_KPROBE
++static inline unsigned int hk_kprobe_pending(void) { return 0; }
++#else
++unsigned int hk_kprobe_pending(void);
++#endif
++
++
++/* drop the blacklist entries, every probe refused with HK_KPROBE_BLACKLISTED
++ * needs this first, hk_kprobe_exit restores them */
++int hk_kprobe_clear_blacklist(void);
++void hk_kprobe_restore_blacklist(void);
++
++/*
++ * what the address gates of register_kprobe make of a symbol, see
++ * hk_inline_state for the inline counterpart
++ */
++enum hk_kprobe_state {
++	HK_KPROBE_UNRESOLVED = 0,	/* the resolver did not find the symbol */
++	HK_KPROBE_UNSUPPORTED,		/* not text, or a cfi preamble symbol */
++	HK_KPROBE_BLACKLISTED,		/* kprobe_blacklist, __kprobes or noinstr */
++	HK_KPROBE_PATCHSITE,		/* a recorded ftrace call site */
++	HK_KPROBE_OK,			/* no address gate matched */
++};
++
++struct hk_kprobe_report {
++	unsigned long addr;	/* resolver result, 0 when unresolved */
++	enum hk_kprobe_state state;
++	const char *reason;	/* static string, the caller never owns it */
++};
++
++/*
++ * the kernel folds every reason it refuses an address into -EINVAL, so a bare
++ * return code cannot tell a blacklisted symbol from an ftrace call site or a
++ * symbol the resolver never found. this asks the same gates in the same order
++ * and names the one that fired. nothing is written, nothing is allocated and
++ * it does not sleep, so a live hot path can be judged before it is probed
++ *
++ * 0 when the report was filled, -EINVAL on a NULL argument. HK_KPROBE_OK means
++ * no address gate matched, an install can still fail on a kernel symbol the
++ * resolver cannot reach or on a tracking node that cannot be allocated. the
++ * same gates guard a kretprobe, register_kretprobe registers a kprobe
++ */
++int hk_kprobe_check(const char *sym, struct hk_kprobe_report *out);
++/* the same gates on an address, for a target that was never a symbol */
++int hk_kprobe_check_at(unsigned long addr, struct hk_kprobe_report *out);
++
++/*
++ * argument and return helpers for a handler on arm64. x0 to x7 carry the first
++ * eight arguments at a function entry, x0 carries the return value when a
++ * kretprobe handler runs, and the kernel writes the registers back after the
++ * handler, so a store to them takes effect
++ */
++static inline unsigned long hk_regs_arg(const struct pt_regs *regs,
++					unsigned int n)
++{
++	if (n >= 8)
++		return 0;
++	return regs->regs[n];
++}
++
++static inline void hk_regs_set_arg(struct pt_regs *regs, unsigned int n,
++				   unsigned long v)
++{
++	if (n < 8)
++		regs->regs[n] = v;
++}
++
++static inline unsigned long hk_regs_ret(const struct pt_regs *regs)
++{
++	return regs->regs[0];
++}
++
++static inline void hk_regs_set_ret(struct pt_regs *regs, unsigned long v)
++{
++	regs->regs[0] = v;
++}
++
++static inline unsigned long hk_regs_ip(const struct pt_regs *regs)
++{
++	return regs->pc;
++}
++
++static inline unsigned long hk_regs_lr(const struct pt_regs *regs)
++{
++	return regs->regs[30];
++}
++
++/* a pre handler that returns 1 must step the pc over the probed instruction */
++static inline void hk_regs_skip(struct pt_regs *regs)
++{
++	regs->pc += 4;
++}
++
++/*
++ * the replacement idiom for a hot target: a pre handler that returns 1 stops the
++ * kernel from running the probed instruction, so parking the pc on the link
++ * register returns from the target at once with x0 as the result, the way a
++ * wrapper would. the prologue of the target has not run yet, so nothing is left
++ * to unwind
++ *
++ *	hk_regs_set_ret(regs, my_device_add(hk_regs_arg(regs, 0)));
++ *	hk_regs_return(regs);
++ *	return 1;
++ */
++static inline void hk_regs_return(struct pt_regs *regs)
++{
++	regs->pc = regs->regs[30];
++}
++
++/*
++ * hand the call to another function instead of running the probed instruction: the
++ * replacement is entered with the argument registers of the target, on the target's
++ * caller stack, and its return goes to the caller of the target, so what it returns
++ * is what the target returns. it is reached by the return from the breakpoint
++ * exception and not by a branch, so no bti landing pad and no cfi check stands at
++ * its entry, and the target never runs unless the replacement calls it
++ *
++ * a handler that redirects returns 1, exactly like one that parks the pc. reaching
++ * the original again is the address of the probed entry: the breakpoint fires a
++ * second time and the handler has to let that call through, which is what the guard
++ * of hk_redir is for
++ */
++static inline void hk_regs_redirect(struct pt_regs *regs, unsigned long fn)
++{
++	regs->pc = fn;
++}
++#endif
+diff --git a/glue/hk/hk_kretprobe.c b/glue/hk/hk_kretprobe.c
+new file mode 100644
+index 0000000..6d9842b
+--- /dev/null
++++ b/glue/hk/hk_kretprobe.c
+@@ -0,0 +1,263 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2026 dere3046
++ */
++
++#include <linux/errno.h>
++#include <linux/list.h>
++#include <linux/module.h>
++#include <linux/printk.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/string.h>
++#include <linux/types.h>
++
++#include "hk.h"
++#include "hk_kprobe.h"
++#include "hk_kretprobe.h"
++
++typedef int (*register_kretprobe_fn)(struct kretprobe *rp);
++typedef void (*unregister_kretprobe_fn)(struct kretprobe *rp);
++
++/* one tracking node per live probe, the list has no ceiling */
++struct hk_kretprobe_node {
++	struct list_head list;
++	struct hk_kretprobe *hook;
++};
++
++static LIST_HEAD(g_kretprobes);
++static DEFINE_SPINLOCK(g_kretprobe_lock);
++
++/* a probe the sweep cannot take back keeps reaching into this module */
++static unsigned int g_kretprobe_stuck;
++
++static __nocfi int call_register_kretprobe(struct kretprobe *rp)
++{
++	register_kretprobe_fn fn;
++
++	fn = (register_kretprobe_fn)hk_resolve("register_kretprobe");
++	if (!fn)
++		return -ENODATA;
++	return fn(rp);
++}
++
++static __nocfi int call_unregister_kretprobe(struct kretprobe *rp)
++{
++	unregister_kretprobe_fn fn;
++
++	fn = (unregister_kretprobe_fn)hk_resolve("unregister_kretprobe");
++	if (!fn)
++		return -ENODATA;
++	fn(rp);
++	return 0;
++}
++
++/* an address and a symbol read the same in a log, one of them is just longer */
++static void hk_kretprobe_label(const struct hk_kretprobe *h, char *buf, size_t len)
++{
++	if (h->rp.kp.symbol_name)
++		strscpy(buf, h->rp.kp.symbol_name, len);
++	else
++		snprintf(buf, len, "0x%lx", (unsigned long)h->rp.kp.addr);
++}
++
++/* register_kretprobe registers a kprobe, the kprobe gates answer for it */
++static void hk_kretprobe_fail(const char *label, int ret,
++			      const struct hk_kprobe_report *rep)
++{
++	pr_warn("[lkmhook] kretprobe %s failed %d %s\n", label, ret, rep->reason);
++}
++
++/*
++ * the gate is asked only after the kernel refused, so a successful install costs
++ * no resolver walk, and the label is the symbol for one route and the address for
++ * the other because that is all either of them has
++ */
++static void hk_kretprobe_fail_route(const struct hk_kretprobe *h, int ret)
++{
++	struct hk_kprobe_report rep;
++	char label[48];
++
++	hk_kretprobe_label(h, label, sizeof(label));
++	if (h->rp.kp.symbol_name) {
++		if (!hk_kprobe_check(h->rp.kp.symbol_name, &rep))
++			hk_kretprobe_fail(label, ret, &rep);
++		return;
++	}
++	if (!hk_kprobe_check_at((unsigned long)h->rp.kp.addr, &rep))
++		hk_kretprobe_fail(label, ret, &rep);
++}
++
++/* an unregistered probe on module text is a use after free, say so */
++static int hk_kretprobe_drop(struct hk_kretprobe *h)
++{
++	char label[48];
++
++	if (!call_unregister_kretprobe(&h->rp))
++		return 0;
++
++	hk_kretprobe_label(h, label, sizeof(label));
++	pr_warn("[lkmhook] kretprobe %s left registered, unregister unresolved\n",
++		label);
++	return -ENODATA;
++}
++
++static void hk_kretprobe_track(struct hk_kretprobe_node *node,
++			       struct hk_kretprobe *h)
++{
++	unsigned long flags;
++
++	node->hook = h;
++	spin_lock_irqsave(&g_kretprobe_lock, flags);
++	list_add(&node->list, &g_kretprobes);
++	spin_unlock_irqrestore(&g_kretprobe_lock, flags);
++}
++
++/* a tracking node is allocated first, so a probe is never left untracked */
++static struct hk_kretprobe_node *hk_kretprobe_node_alloc(const char *label)
++{
++	struct hk_kretprobe_node *node;
++
++	node = kzalloc(sizeof(*node), GFP_KERNEL);
++	if (!node)
++		pr_warn("[lkmhook] kretprobe %s failed -ENOMEM, no tracking node\n",
++			label);
++	return node;
++}
++
++/* register, track and report: the two installs differ in one field */
++static int hk_kretprobe_add(struct hk_kretprobe *h)
++{
++	struct hk_kretprobe_node *node;
++	char label[48];
++	int ret;
++
++	hk_kretprobe_label(h, label, sizeof(label));
++	node = hk_kretprobe_node_alloc(label);
++	if (!node)
++		return -ENOMEM;
++
++	ret = call_register_kretprobe(&h->rp);
++	if (ret < 0) {
++		kfree(node);
++		hk_kretprobe_fail_route(h, ret);
++		return ret;
++	}
++
++	hk_kretprobe_track(node, h);
++	pr_info("[lkmhook] kretprobe %s @ 0x%lx\n", label,
++		(unsigned long)h->rp.kp.addr);
++	return 0;
++}
++
++int hk_kretprobe_install(struct hk_kretprobe *h, const char *sym,
++			 kretprobe_handler_t handler)
++{
++	if (!h || !sym || !handler)
++		return -EINVAL;
++
++	memset(h, 0, sizeof(*h));
++	h->rp.kp.symbol_name = sym;
++	h->rp.handler = handler;
++
++	return hk_kretprobe_add(h);
++}
++
++int hk_kretprobe_install_at(struct hk_kretprobe *h, unsigned long addr,
++			    kretprobe_handler_t handler)
++{
++	if (!h || !addr || !handler)
++		return -EINVAL;
++
++	memset(h, 0, sizeof(*h));
++	h->rp.kp.addr = (kprobe_opcode_t *)addr;
++	h->rp.handler = handler;
++
++	return hk_kretprobe_add(h);
++}
++
++int hk_kretprobe_install_ex(struct hk_kretprobe *h, const char *sym,
++			    kretprobe_handler_t entry,
++			    kretprobe_handler_t handler,
++			    size_t data_size)
++{
++	struct hk_kretprobe_node *node;
++	int ret;
++
++	if (!h || !sym || !handler)
++		return -EINVAL;
++
++	node = hk_kretprobe_node_alloc(sym);
++	if (!node)
++		return -ENOMEM;
++
++	memset(h, 0, sizeof(*h));
++	h->rp.kp.symbol_name = sym;
++	h->rp.entry_handler = entry;
++	h->rp.handler = handler;
++	h->rp.data_size = data_size;
++
++	ret = call_register_kretprobe(&h->rp);
++	if (ret < 0) {
++		kfree(node);
++		hk_kretprobe_fail_route(h, ret);
++		return ret;
++	}
++
++	hk_kretprobe_track(node, h);
++	pr_info("[lkmhook] kretprobe %s\n", sym);
++	return 0;
++}
++
++int hk_kretprobe_remove(struct hk_kretprobe *h)
++{
++	struct hk_kretprobe_node *node;
++	struct hk_kretprobe_node *found = NULL;
++	unsigned long flags;
++
++	if (!h)
++		return -EINVAL;
++
++	spin_lock_irqsave(&g_kretprobe_lock, flags);
++	list_for_each_entry(node, &g_kretprobes, list) {
++		if (node->hook != h)
++			continue;
++		list_del(&node->list);
++		found = node;
++		break;
++	}
++	spin_unlock_irqrestore(&g_kretprobe_lock, flags);
++
++	/* not tracked means not registered, a second remove is a no op */
++	if (!found)
++		return 0;
++
++	/* unregister sleeps, it stays outside the list lock */
++	kfree(found);
++	return hk_kretprobe_drop(h);
++}
++
++void hk_kretprobe_exit(void)
++{
++	struct hk_kretprobe_node *node;
++	struct hk_kretprobe_node *tmp;
++	LIST_HEAD(pending);
++	unsigned long flags;
++
++	/* take the list off the lock first, unregister sleeps */
++	spin_lock_irqsave(&g_kretprobe_lock, flags);
++	list_splice_init(&g_kretprobes, &pending);
++	spin_unlock_irqrestore(&g_kretprobe_lock, flags);
++
++	list_for_each_entry_safe(node, tmp, &pending, list) {
++		if (hk_kretprobe_drop(node->hook))
++			g_kretprobe_stuck++;
++		list_del(&node->list);
++		kfree(node);
++	}
++}
++
++unsigned int hk_kretprobe_pending(void)
++{
++	return READ_ONCE(g_kretprobe_stuck);
++}
+diff --git a/glue/hk/hk_kretprobe.h b/glue/hk/hk_kretprobe.h
+new file mode 100644
+index 0000000..d11ac9a
+--- /dev/null
++++ b/glue/hk/hk_kretprobe.h
+@@ -0,0 +1,82 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2026 dere3046
++ */
++
++#ifndef LKMHOOK_HK_KRETPROBE_H
++#define LKMHOOK_HK_KRETPROBE_H
++
++#include <linux/kprobes.h>
++#include <linux/types.h>
++
++struct hk_kretprobe {
++	struct kretprobe rp;
++};
++
++/*
++ * a kretprobe fires after the target returns, the return value is in x0 and a
++ * store to regs through hk_regs_set_ret rewrites it, which a kprobe cannot do
++ * the handler runs on the returning core with the registers of the caller, so
++ * the call has already happened and cannot be suppressed. use the entry and
++ * return pair when the handler needs per call state, the entry handler returns
++ * 1 to accept the instance and fills ri->data with data_size bytes
++ *
++ * the address gates are the kprobe ones, register_kretprobe registers a kprobe
++ * first, so hk_kprobe_check answers for a kretprobe target too and a refused
++ * install logs the symbol and the gate. installs are tracked in a list and
++ * removed again by hk_kretprobe_exit, there is no ceiling and no -ENOSPC,
++ * -ENOMEM when the tracking node cannot be allocated and nothing is registered
++ *
++ * the target has to return. a function that never returns leaks one instance
++ * per call until maxactive runs out, and the probe then misses returns instead
++ * of failing the install. a hot target other cores execute during
++ * installation still belongs here, never to hk_inline_hook
++ */
++int hk_kretprobe_install(struct hk_kretprobe *h, const char *sym,
++			 kretprobe_handler_t handler);
++int hk_kretprobe_install_ex(struct hk_kretprobe *h, const char *sym,
++			    kretprobe_handler_t entry,
++			    kretprobe_handler_t handler,
++			    size_t data_size);
++/*
++ * the same for a target the caller holds as an address, which is what a function
++ * of its own needs: a completion signal has to sit on the replacement, and a
++ * replacement is a pointer, not a name
++ */
++int hk_kretprobe_install_at(struct hk_kretprobe *h, unsigned long addr,
++			    kretprobe_handler_t handler);
++/*
++ * unregister and drop the tracking node, a second remove is a no op. 0 when the
++ * probe is gone, -ENODATA when unregister_kretprobe cannot be reached and the
++ * probe is still armed
++ */
++int hk_kretprobe_remove(struct hk_kretprobe *h);
++/*
++ * what a consumer compiles in is its own build decision. setting the flag leaves
++ * this module out of the link, and the calls the core makes into it become
++ * nothing, while the entry points of the module itself stay declared: calling one
++ * of those without its object is a link error, never a silent no op
++ */
++#ifdef HK_NO_KRETPROBE
++static inline void hk_kretprobe_exit(void) { }
++#else
++/* unregister every tracked probe, called by hk_exit */
++void hk_kretprobe_exit(void);
++#endif
++/*
++ * probes the exit sweep could not take back, the counterpart of
++ * hk_kprobe_pending and counted by the same gate
++ */
++/*
++ * what a consumer compiles in is its own build decision. setting the flag leaves
++ * this module out of the link, and the calls the core makes into it become
++ * nothing, while the entry points of the module itself stay declared: calling one
++ * of those without its object is a link error, never a silent no op
++ */
++#ifdef HK_NO_KRETPROBE
++static inline unsigned int hk_kretprobe_pending(void) { return 0; }
++#else
++unsigned int hk_kretprobe_pending(void);
++#endif
++
++#endif
+diff --git a/glue/hk/hk_ksym.c b/glue/hk/hk_ksym.c
+new file mode 100644
+index 0000000..ae81246
+--- /dev/null
++++ b/glue/hk/hk_ksym.c
+@@ -0,0 +1,33 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2026 dere3046
++ */
++
++#include <linux/module.h>
++#include <linux/printk.h>
++
++#include "hk.h"
++#include "hk_ksym.h"
++
++int hk_ksym_register(const struct hk_sym *table)
++{
++	const struct hk_sym *e;
++	unsigned long v;
++	int fail = 0;
++
++	if (!table)
++		return -EINVAL;
++
++	for (e = table; e->name; e++) {
++		v = hk_resolve(e->name);
++		if (!v && e->fallback)
++			v = hk_resolve(e->fallback);
++		if (e->storage)
++			*e->storage = (void *)v;
++		if (!v && e->required) {
++			pr_warn("[lkmhook] sym missing %s\n", e->name);
++			fail++;
++		}
++	}
++	return fail ? -ENOENT : 0;
++}
+diff --git a/glue/hk/hk_ksym.h b/glue/hk/hk_ksym.h
+new file mode 100644
+index 0000000..ff41989
+--- /dev/null
++++ b/glue/hk/hk_ksym.h
+@@ -0,0 +1,20 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2026 dere3046
++ */
++
++#ifndef LKMHOOK_HK_KSYM_H
++#define LKMHOOK_HK_KSYM_H
++
++#include <linux/types.h>
++
++struct hk_sym {
++	const char *name;
++	const char *fallback;
++	void **storage;
++	bool required;
++};
++
++int hk_ksym_register(const struct hk_sym *table);
++
++#endif
+diff --git a/glue/hk/hk_patch.c b/glue/hk/hk_patch.c
+new file mode 100644
+index 0000000..eecc479
+--- /dev/null
++++ b/glue/hk/hk_patch.c
+@@ -0,0 +1,1411 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2026 dere3046
++ */
++
++#include <linux/crc32.h>
++#include <linux/errno.h>
++#include <linux/kernel.h>
++#include <linux/list.h>
++#include <linux/cpu.h>
++#include <linux/mm.h>
++#include <linux/uaccess.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/printk.h>
++#include <linux/slab.h>
++#include <linux/stop_machine.h>
++#include <linux/string.h>
++#include <linux/vmalloc.h>
++#include <asm/cacheflush.h>
++#include <asm/fixmap.h>
++#include <asm/memory.h>
++#include <asm/pgtable.h>
++
++#include "hk.h"
++#include "hk_patch.h"
++
++/*
++ * the base is the first slot of the early ioremap window and not FIX_TEXT_POKE0.
++ * the enum between the two is not spare: a kernel with UNMAP_KERNEL_AT_EL0 adds
++ * FIX_ENTRY_TRAMP_TEXT1 to TEXT4 above FIX_TEXT_POKE0, the KPTI entry
++ * trampoline is mapped there by map_entry_trampoline, and a patch that opened
++ * one of those slots and unmapped it again would clear a live trampoline page
++ * table entry. FIX_BTMAP_END is __end_of_permanent_fixed_addresses in every
++ * build of this series, so it sits above the whole permanent window including
++ * the trampoline slots, and the window it starts is the boot only early ioremap
++ * one, which nothing holds after early_ioremap_reset
++ */
++#define HK_FIXMAP_SLOT_BASE FIX_BTMAP_END
++#define HK_FIXMAP_SLOT_MAX 8
++
++typedef void (*clean_inval_fn)(unsigned long start, unsigned long end);
++typedef void (*fixmap_fn)(unsigned long idx, phys_addr_t phys, pgprot_t prot);
++typedef int (*insn_write_fn)(void *addr, u32 insn);
++typedef int (*insn_patch_fn)(void *addr[], u32 insn[], int count);
++
++/*
++ * one mutex covers the whole path because the paths sleep: __set_fixmap flushes
++ * a TLB, stop_machine parks the other cores and aarch64_insn_patch_text takes
++ * cpus_read_lock. a spinlock cannot be held over any of them, so it is not held
++ * at all and every caller is documented as process context
++ */
++static DEFINE_MUTEX(g_patch_lock);
++/*
++ * the path a plain call takes, set once by hk_init from the configuration of the
++ * consumer and never changed afterwards. the library keeps no other state, and
++ * every decision about fallbacks, retries and tests belongs to the caller
++ */
++static int (*g_write)(void *dst, const void *src, size_t len);
++typedef struct vm_struct *(*find_vm_area_fn)(const void *addr);
++#define HK_WALK_PTE 0
++#define HK_WALK_PMD 1
++#define HK_WALK_PUD 2
++#define HK_WALK_P4D 3
++
++static unsigned long *hk_dst_pte(unsigned long addr);
++/*
++ * the range the kernel translates arithmetically when it patches: is_image_text is
++ * core_kernel_text, which is text and nothing else. rodata and data are not in it
++ * even though they are part of the image, and the kernel sends those to
++ * vmalloc_to_page, which is the whole reason this question exists
++ */
++static unsigned long g_stext;
++static unsigned long g_etext;
++static bool g_stext_read;
++
++static bool hk_core_text(unsigned long addr)
++{
++	unsigned long fn;
++
++	if (!g_stext_read) {
++		fn = hk_resolve("_stext");
++		if (fn && hk_ker_addr_ok(fn))
++			g_stext = fn;
++		fn = hk_resolve("_etext");
++		if (fn && hk_ker_addr_ok(fn))
++			g_etext = fn;
++		g_stext_read = true;
++	}
++	if (!g_stext || !g_etext)
++		return false;
++	return addr >= g_stext && addr < g_etext;
++}
++
++static bool hk_kernel_image_addr(unsigned long addr);
++static __nocfi noinline int hk_translate(unsigned long addr, unsigned long *out);
++
++static int hk_walk_pa(unsigned long addr, unsigned long *out,
++		     unsigned long *desc, int *level);
++
++static int hk_slot_write(void *dst, const void *src, size_t len,
++			unsigned long (*to_pa)(unsigned long va), bool nofault);
++
++/*
++ * an address the kernel's own patch_map would hand to vmalloc_to_page is every
++ * address that is not core kernel text, which is the same test the kernel makes
++ */
++static find_vm_area_fn g_find_vm_area;
++
++/*
++ * a resolved kernel symbol cannot be called from a checked site on the old cfi
++ * builds, the type clang recorded for it is not the one the cast produces, so the
++ * call lives behind a wrapper whose body is off, the same shape every other
++ * resolved call in this file has
++ */
++static __nocfi noinline struct vm_struct *call_find_vm_area(const void *addr)
++{
++	if (!g_find_vm_area)
++		return NULL;
++	return g_find_vm_area(addr);
++}
++typedef int (*nofault_write_fn)(void *dst, const void *src, size_t len);
++static nofault_write_fn g_nofault_write;
++
++/*
++ * a store that cannot land has to come back as an error, and the helper that does
++ * it is resolved at run time like everything else here: the kernel does not export
++ * it, so naming it at link time would leave the module with a symbol the running
++ * kernel may not have
++ */
++static __nocfi noinline int call_nofault_write(void *dst, const void *src,
++					       size_t len)
++{
++	if (!g_nofault_write)
++		return -EOPNOTSUPP;
++	return g_nofault_write(dst, src, len);
++}
++static unsigned long (*g_vmalloc_to_pfn_fn)(const void *addr);
++static unsigned long g_kimage_voffset;
++static bool g_kimage_voffset_read;
++
++
++/*
++ * the target's own entry decides whether the alias is needed at all. a page the
++ * kernel already maps writable is written in place, exactly like patch_map does
++ * when the strict rwx configs are off
++ */
++/*
++ * the kernel's own translation, which is what the kernel's own patcher uses and
++ * therefore agrees with it byte for byte. a kernel older than 5.13 answers a block
++ * mapped address with a null page instead of an error, and the frame that comes
++ * out of it is whatever the arithmetic makes of that, so the answer is checked
++ * against the memory the kernel owns before it is handed back
++ */
++unsigned long hk_va_to_pa(unsigned long va)
++{
++	unsigned long pa = 0;
++
++	if (hk_translate(va, &pa))
++		return 0;
++	if (!pfn_valid(pa >> PAGE_SHIFT))
++		return 0;
++	return pa;
++}
++
++static clean_inval_fn g_clean_inval;
++static fixmap_fn g_set_fixmap;
++static insn_write_fn g_insn_write;
++static insn_patch_fn g_insn_patch;
++static unsigned long g_image_start;
++static unsigned long g_image_end;
++static bool g_image_read;
++
++void hk_patch_init(void)
++{
++	unsigned long fn;
++	int missing = 0;
++
++	fn = hk_resolve("__set_fixmap");
++	if (fn && hk_ker_addr_ok(fn))
++		g_set_fixmap = (fixmap_fn)fn;
++	else
++		missing++;
++
++	fn = hk_resolve("caches_clean_inval_pou");
++	if (!fn)
++		fn = hk_resolve("dcache_clean_inval_poc");
++	if (!fn)
++		fn = hk_resolve("__flush_icache_range");
++	if (fn && hk_ker_addr_ok(fn))
++		g_clean_inval = (clean_inval_fn)fn;
++	else
++		missing++;
++
++	fn = hk_resolve("aarch64_insn_write");
++	if (fn && hk_ker_addr_ok(fn))
++		g_insn_write = (insn_write_fn)fn;
++	else
++		missing++;
++
++	fn = hk_resolve("aarch64_insn_patch_text");
++	if (fn && hk_ker_addr_ok(fn))
++		g_insn_patch = (insn_patch_fn)fn;
++	else
++		missing++;
++
++	/*
++	 * the two the slot path needs are optional on their own: the image and
++	 * the linear map are translated arithmetically and never ask for them
++	 */
++
++	/*
++	 * the two the block mapping test needs. core_kernel_text is the kernel's own
++	 * test for the addresses its patcher translates arithmetically, and
++	 * vmalloc_to_page is asked directly for the block mapped ones
++	 */
++	fn = hk_resolve("copy_to_kernel_nofault");
++	if (fn && hk_ker_addr_ok(fn))
++		g_nofault_write = (nofault_write_fn)fn;
++
++	pr_info("[lkmhook] patch symbols ready, %d optional missing\n", missing);
++}
++
++/*
++ * the index is an enum constant plus 0 to 7, so it folds at compile time and the
++ * bound is checked then too: an index over FIX_BTMAP_BEGIN belongs to the page
++ * table fixmaps at the end of the enum, which are live, and the check refuses it
++ * before __set_fixmap, whose own guard is a BUG_ON. the dst warning in the write
++ * path is the runtime half of the same answer, it probes the address the slot
++ * actually resolved to
++ */
++static int hk_patch_slot_index(int *out)
++{
++	unsigned long idx = HK_FIXMAP_SLOT_BASE;
++	if (idx > FIX_BTMAP_BEGIN) {
++		pr_warn("[lkmhook] fixmap base 0x%lx lands outside the early ioremap window\n",
++			idx);
++		return -EINVAL;
++	}
++	*out = (int)idx;
++	return 0;
++}
++
++static __nocfi noinline int call_clean_inval(unsigned long start,
++					     unsigned long end)
++{
++	unsigned long fn;
++
++	if (!g_clean_inval) {
++		fn = hk_resolve("caches_clean_inval_pou");
++		if (!fn)
++			fn = hk_resolve("dcache_clean_inval_poc");
++		if (!fn)
++			fn = hk_resolve("__flush_icache_range");
++		if (!fn) {
++			pr_warn("[lkmhook] no cache clean fn, the write is refused\n");
++			return -ENOENT;
++		}
++		g_clean_inval = (clean_inval_fn)fn;
++	}
++	g_clean_inval(start, end);
++	return 0;
++}
++
++static __nocfi noinline int call_set_fixmap(unsigned long idx,
++					    phys_addr_t phys, pgprot_t prot)
++{
++	if (!g_set_fixmap) {
++		unsigned long fn = hk_resolve("__set_fixmap");
++
++		if (!fn) {
++			pr_warn("[lkmhook] __set_fixmap not found, the write is refused\n");
++			return -ENOENT;
++		}
++		g_set_fixmap = (fixmap_fn)fn;
++	}
++	g_set_fixmap(idx, phys, prot);
++	return 0;
++}
++
++/*
++ * the copy goes through the alias __set_fixmap just opened, the only way into
++ * read only text, and it is a plain memcpy that faults with no way back. the gate
++ * therefore runs before every store and a destination that is not mapped is
++ * refused with -ENXIO instead of being written. it is a page table walk and not
++ * a probe: a probe reports the same thing but only after the walk has already
++ * answered, and a walk cannot be fooled by a slot that maps a page of zeros
++ *
++ * the walk is the one the kernel itself uses on init_mm, so it stays correct for
++ * whatever paging levels the running kernel was built with. a block mapping at
++ * any level means there is no pte to read and the gate refuses
++ */
++static __maybe_unused unsigned long *hk_dst_pte(unsigned long addr)
++{
++	struct mm_struct *mm;
++	pgd_t *pgd;
++	p4d_t *p4d;
++	pud_t *pud;
++	pmd_t *pmd;
++
++	mm = (struct mm_struct *)hk_resolve("init_mm");
++	if (!mm || !hk_ker_addr_ok((unsigned long)mm))
++		return NULL;
++	pgd = pgd_offset(mm, addr);
++	if (pgd_none(*pgd) || pgd_bad(*pgd))
++		return NULL;
++	p4d = p4d_offset(pgd, addr);
++	if (p4d_none(*p4d) || p4d_bad(*p4d))
++		return NULL;
++	pud = pud_offset(p4d, addr);
++	if (pud_none(*pud) || pud_bad(*pud))
++		return NULL;
++	pmd = pmd_offset(pud, addr);
++	if (pmd_none(*pmd) || pmd_bad(*pmd))
++		return NULL;
++	return (unsigned long *)pte_offset_kernel(pmd, addr);
++}
++
++/*
++ * the library's own translation. every level is asked for none, bad and leaf in
++ * that order, because on arm64 a block descriptor fails the table test, so the
++ * leaf question has to be asked first. the kernel's own vmalloc_to_page only
++ * learned that in 5.13, and its 5.10 form warns and returns NULL for a block,
++ * which is a wrong frame rather than an error
++ */
++static int hk_walk_pa(unsigned long addr, unsigned long *out,
++		     unsigned long *desc, int *level)
++{
++	struct mm_struct *mm;
++	pgd_t *pgd;
++	p4d_t *p4d;
++	pud_t *pud;
++	pmd_t *pmd;
++	pte_t *pte;
++
++	mm = (struct mm_struct *)hk_resolve("init_mm");
++	if (!mm || !hk_ker_addr_ok((unsigned long)mm))
++		return -ENOENT;
++
++	pgd = pgd_offset(mm, addr);
++	if (pgd_none(*pgd) || pgd_bad(*pgd))
++		return -ENOENT;
++	p4d = p4d_offset(pgd, addr);
++	if (p4d_none(*p4d) || p4d_bad(*p4d))
++		return -ENOENT;
++#if defined(p4d_leaf)
++	if (p4d_leaf(*p4d)) {
++		*out = __p4d_to_phys(*p4d) + (addr & ~P4D_MASK);
++		if (desc)
++			*desc = p4d_val(*p4d);
++		if (level)
++			*level = HK_WALK_P4D;
++		return 0;
++	}
++#endif
++	pud = pud_offset(p4d, addr);
++	if (pud_none(*pud) || pud_bad(*pud))
++		return -ENOENT;
++#if defined(pud_leaf)
++	if (pud_leaf(*pud)) {
++		*out = __pud_to_phys(*pud) + (addr & ~PUD_MASK);
++		if (desc)
++			*desc = pud_val(*pud);
++		if (level)
++			*level = HK_WALK_PUD;
++		return 0;
++	}
++#endif
++	pmd = pmd_offset(pud, addr);
++	if (pmd_none(*pmd))
++		return -ENOENT;
++#if defined(pmd_leaf)
++	if (pmd_leaf(*pmd)) {
++		*out = __pmd_to_phys(*pmd) + (addr & ~PMD_MASK);
++		if (desc)
++			*desc = pmd_val(*pmd);
++		if (level)
++			*level = HK_WALK_PMD;
++		return 0;
++	}
++#endif
++	if (pmd_bad(*pmd))
++		return -ENOENT;
++	pte = pte_offset_kernel(pmd, addr);
++	if (!pte_present(*pte))
++		return -ENOENT;
++	*out = __pte_to_phys(*pte) + (addr & ~PAGE_MASK);
++	if (desc)
++		*desc = pte_val(*pte);
++	if (level)
++		*level = HK_WALK_PTE;
++	return 0;
++}
++
++unsigned long hk_va_walk_pa(unsigned long va)
++{
++	unsigned long pa = 0;
++
++	if (hk_walk_pa(va, &pa, NULL, NULL))
++		return 0;
++	return pa;
++}
++
++/*
++ * the same walk, answering what a caller checks a destination with. the answer
++ * comes from the descriptor of the level that maps the address, so a block mapping
++ * answers as truthfully as a page one
++ */
++int hk_route_probe(unsigned long addr, struct hk_route *out)
++{
++	unsigned long pa;
++
++	if (!out || !addr)
++		return -EINVAL;
++	memset(out, 0, sizeof(*out));
++	out->kind = hk_va_kind(addr);
++	out->level = hk_va_level(addr);
++	out->block_map = out->level > 0;
++	out->writable = hk_va_writable(addr);
++	pa = hk_va_walk_pa(addr);
++	out->maps = pa && hk_va_maps(addr, pa);
++	return 0;
++}
++
++bool hk_va_writable(unsigned long va)
++{
++	unsigned long pa = 0;
++	unsigned long desc = 0;
++
++	if (hk_walk_pa(va, &pa, &desc, NULL))
++		return false;
++	return pte_write(__pte(desc));
++}
++
++bool hk_va_maps(unsigned long va, unsigned long pa)
++{
++	unsigned long got = 0;
++
++	if (hk_walk_pa(va, &got, NULL, NULL))
++		return false;
++	return (got & PAGE_MASK) == (pa & PAGE_MASK);
++}
++
++/*
++ * image addresses are the one range virt_addr_valid cannot answer for: the image
++ * sits in the vmalloc window, so the linear mapping test fails on it while __pa
++ * would subtract the wrong offset. _text and _end are the bounds and both are
++ * read once. the answer is a plain range test, a bare virtual address inside the
++ * image is never handed to vmalloc_to_pfn, whose pmd walk reads a block mapping
++ * as if it were a pte table and returns a physical address from unrelated page
++ * contents. a kernel without the two symbols answers false and the vmalloc
++ * branch is gated by find_vm_area instead
++ */
++static bool hk_kernel_image_addr(unsigned long addr)
++{
++	unsigned long start;
++	unsigned long end;
++
++	if (!g_image_read) {
++		start = hk_resolve("_text");
++		if (!start)
++			start = hk_resolve("_stext");
++		end = hk_resolve("_end");
++		if (!end)
++			end = hk_resolve("__bss_stop");
++		g_image_read = true;
++		if (!start || !end || end <= start ||
++		    !hk_ker_addr_ok(start) || !hk_ker_addr_ok(end)) {
++			pr_warn_once("[lkmhook] _text/_end unavailable, image addresses fall to the vmalloc branch\n");
++			return false;
++		}
++		g_image_start = start;
++		g_image_end = end;
++	}
++	return g_image_start && addr >= g_image_start && addr < g_image_end;
++}
++
++static __nocfi noinline int hk_translate(unsigned long addr, unsigned long *out)
++{
++	unsigned long fn;
++	unsigned long phys;
++	unsigned long pfn;
++	unsigned long voff;
++	bool image;
++
++	/*
++	 * the order matters. the image range is asked first because it is the one
++	 * test that needs a symbol, and a caller that names an address no path can
++	 * reach gets -EIO with no walk attempted, so a runaway value cannot reach
++	 * vmalloc_to_pfn and come back with a physical address built from whatever
++	 * the pmd entry it read happened to hold
++	 */
++	image = hk_kernel_image_addr(addr);
++	if (!image && !__is_lm_address(addr) && !is_vmalloc_addr((void *)addr)) {
++		pr_warn("[lkmhook] 0x%lx is not a kernel address this build can reach\n",
++			addr);
++		return -EIO;
++	}
++
++	if (image) {
++		if (!g_kimage_voffset_read) {
++			fn = hk_resolve("kimage_voffset");
++			if (!fn || !hk_ker_addr_ok(fn)) {
++				pr_warn("[lkmhook] kimage_voffset not found, image addresses cannot be translated\n");
++				return -ENOENT;
++			}
++			if (copy_from_kernel_nofault(&voff, (void *)fn,
++						     sizeof(voff))) {
++				pr_warn("[lkmhook] kimage_voffset unreadable\n");
++				return -EFAULT;
++			}
++			g_kimage_voffset = voff;
++			g_kimage_voffset_read = true;
++		}
++		if (!g_kimage_voffset) {
++			pr_warn("[lkmhook] kimage_voffset is zero\n");
++			return -EINVAL;
++		}
++		*out = addr - g_kimage_voffset;
++		return 0;
++	}
++
++	if (__is_lm_address(addr)) {
++		*out = __pa(addr);
++		return 0;
++	}
++
++	if (!g_find_vm_area) {
++		fn = hk_resolve("find_vm_area");
++		if (fn && hk_ker_addr_ok(fn))
++			g_find_vm_area = (find_vm_area_fn)fn;
++	}
++	if (g_find_vm_area && !g_find_vm_area((const void *)addr)) {
++		pr_warn("[lkmhook] 0x%lx is not a registered vmalloc area\n",
++			addr);
++		return -EIO;
++	}
++	if (!g_vmalloc_to_pfn_fn) {
++		fn = hk_resolve("vmalloc_to_pfn");
++		if (!fn || !hk_ker_addr_ok(fn)) {
++			pr_warn("[lkmhook] vmalloc_to_pfn not found, the write is refused\n");
++			return -ENOENT;
++		}
++		g_vmalloc_to_pfn_fn = (unsigned long (*)(const void *))fn;
++	}
++	pfn = g_vmalloc_to_pfn_fn((const void *)addr);
++	if (!pfn) {
++		pr_warn("[lkmhook] 0x%lx has no page\n", addr);
++		return -EFAULT;
++	}
++	phys = (pfn << PAGE_SHIFT) + (addr & ~PAGE_MASK);
++	*out = phys;
++	return 0;
++}
++
++struct hk_patch_job {
++	unsigned long addr;
++	const void *src;
++	size_t len;
++	int flags;
++	int idx;
++	unsigned long caller;
++	unsigned long (*to_pa)(unsigned long va);
++	bool nofault;
++	bool kernel_slot;
++	atomic_t arrived;
++	int ret;
++	/*
++	 * released by the master once the slot is closed and the writes are done,
++	 * the other cpus spin on it before they return from the callback
++	 */
++	int done;
++};
++
++/*
++ * the write through the alias. one slot serves any length, the alias is opened
++ * per physical page and dropped again. the caller holds g_patch_lock, so the
++ * slot is not shared and neither is the kernel patch slot
++ */
++static int hk_patch_slot_run(unsigned long addr, const void *src, size_t len,
++			     int flags, int idx, unsigned long caller,
++			     unsigned long (*to_pa)(unsigned long va),
++			     bool nofault)
++{
++	size_t left = len;
++	int ret = 0;
++
++	while (left) {
++		unsigned long phys;
++		unsigned long dst;
++		size_t chunk;
++		bool opened = false;
++
++		phys = to_pa(addr);
++		if (!phys) {
++			ret = -ENOENT;
++			break;
++		}
++		chunk = min(left, PAGE_SIZE - (phys & ~PAGE_MASK));
++
++		ret = call_set_fixmap(idx, phys & PAGE_MASK, PAGE_KERNEL);
++		if (ret)
++			break;
++		dst = __fix_to_virt(idx) + (phys & ~PAGE_MASK);
++		if (ret) {
++			call_set_fixmap(idx, 0, __pgprot(0));
++			break;
++		}
++		opened = true;
++
++		if (nofault) {
++			ret = (int)call_nofault_write((void *)dst, src, chunk);
++		} else {
++			memcpy((void *)dst, src, chunk);
++			dsb(ish);
++		}
++		if (opened)
++			call_set_fixmap(idx, 0, __pgprot(0));
++		if (ret)
++			break;
++
++		ret = call_clean_inval(addr, addr + chunk);
++		if (ret)
++			break;
++		hk_flush_icache(addr);
++
++		src += chunk;
++		addr += chunk;
++		left -= chunk;
++	}
++	return ret;
++}
++
++/*
++ * one fixmap slot and one page table entry are shared by the whole machine, so
++ * only one of the stopped cpus may open it. the last one to arrive is the master,
++ * the others spin until it is done, which is what the kernel's own patcher does
++ * for the same reason. without this every stopped cpu opens and closes the slot
++ * under the others and a cpu that passed the destination gate can lose the entry
++ * before its store lands
++ */
++static int hk_patch_slot_cb(void *data)
++{
++	struct hk_patch_job *job = data;
++
++	if (atomic_inc_return(&job->arrived) != num_online_cpus()) {
++		while (!smp_load_acquire(&job->done))
++			cpu_relax();
++		return 0;
++	}
++	job->ret = hk_patch_slot_run(job->addr, job->src, job->len, job->flags,
++				     job->idx, job->caller, job->to_pa,
++				     job->nofault);
++	smp_store_release(&job->done, 1);
++	return job->ret;
++}
++
++typedef struct module *(*hk_module_address_fn)(unsigned long addr);
++
++/*
++ * the module a text or data address belongs to, NULL for anything else. the
++ * symbol is resolved at runtime. it is asked before the slot path is entered
++ * because a module address has a page table the kernel's own patch primitive
++ * already knows how to reach, while the frame the slot path computes is a build
++ * constant of this module and does not have to be the one the running kernel
++ * mapped its fixmap window with
++ */
++static __maybe_unused bool hk_is_module_addr(unsigned long addr)
++{
++	static hk_module_address_fn fn;
++	static bool tried;
++
++	if (!tried) {
++		unsigned long sym = hk_resolve("__module_address");
++
++		tried = true;
++		if (sym && hk_ker_addr_ok(sym))
++			fn = (hk_module_address_fn)sym;
++	}
++	return fn && fn(addr) != NULL;
++}
++
++/*
++ * the kernel's own patch primitive, stop_machine inside. stop_machine_cpuslocked
++ * asserts that cpus_read_lock is held, kprobe and ftrace call it from under
++ * theirs, so it is taken here. the symbol is resolved at runtime because it is
++ * not exported
++ */
++static __nocfi int hk_insn_patch_once(unsigned long addr, const void *src,
++				     size_t len)
++{
++	void *addrs[HK_PATCH_INSNS_MAX];
++	u32 insns[HK_PATCH_INSNS_MAX];
++	const u32 *in = src;
++	int count = (int)(len / 4);
++	int ret;
++	int i;
++
++	if ((len & 3) || (addr & 3)) {
++		pr_warn("[lkmhook] insn patch wants a word aligned range\n");
++		return -EINVAL;
++	}
++	if (count < 1 || count > HK_PATCH_INSNS_MAX) {
++		pr_warn("[lkmhook] insn patch takes 1 to %d instructions\n",
++			HK_PATCH_INSNS_MAX);
++		return -E2BIG;
++	}
++
++
++	for (i = 0; i < count; i++) {
++		addrs[i] = (void *)(addr + i * 4);
++		insns[i] = in[i];
++	}
++	if (!g_insn_patch) {
++		unsigned long fn = hk_resolve("aarch64_insn_patch_text");
++
++		if (!fn) {
++			pr_warn("[lkmhook] aarch64_insn_patch_text not found\n");
++			return -ENOENT;
++		}
++		g_insn_patch = (insn_patch_fn)fn;
++	}
++
++	cpus_read_lock();
++	ret = g_insn_patch(addrs, insns, count);
++	cpus_read_unlock();
++	if (ret)
++		return ret;
++	return call_clean_inval(addr, addr + len);
++}
++
++/*
++ * the primitive takes a table of addresses and is bounded by HK_PATCH_INSNS_MAX,
++ * which is what its own callers use, so a longer run is split into calls of that
++ * size. the whole run is still covered by cpus_read_lock around each call and by
++ * the caller's g_patch_lock across all of them
++ */
++static int hk_insn_patch_run(unsigned long addr, const void *src, size_t len)
++{
++	size_t chunk;
++	int ret;
++
++	while (len) {
++		chunk = min_t(size_t, len, HK_PATCH_INSNS_MAX * 4);
++		ret = hk_insn_patch_once(addr, src, chunk);
++		if (ret)
++			return ret;
++		addr += chunk;
++		src += chunk;
++		len -= chunk;
++	}
++	return 0;
++}
++
++/*
++ * the kernel's own slot, one instruction at a time, caller flushes. the address
++ * has to be readable as a vmalloc or image address for the kernel's own
++ * translation, so it is checked here before the call
++ */
++static __nocfi int hk_insn_write_run(unsigned long addr, const void *src,
++				     size_t len)
++{
++	const u32 *in = src;
++	unsigned long start = addr;
++	unsigned long left = len;
++	unsigned long phys;
++	int ret;
++
++	if ((len & 3) || (addr & 3) || ((addr & ~PAGE_MASK) + len) > PAGE_SIZE) {
++		pr_warn("[lkmhook] insn write wants one aligned page of words\n");
++		return -EINVAL;
++	}
++	ret = hk_translate(addr, &phys);
++	if (ret)
++		return ret;
++	if (!g_insn_write) {
++		unsigned long fn = hk_resolve("aarch64_insn_write");
++
++		if (!fn) {
++			pr_warn("[lkmhook] aarch64_insn_write not found\n");
++			return -ENOENT;
++		}
++		g_insn_write = (insn_write_fn)fn;
++	}
++	cpus_read_lock();
++	while (left) {
++		ret = g_insn_write((void *)addr, *in);
++		if (ret)
++			break;
++		addr += 4;
++		in++;
++		left -= 4;
++	}
++	cpus_read_unlock();
++	if (ret)
++		return ret;
++	ret = call_clean_inval(start, start + len);
++	if (ret)
++		return ret;
++	hk_flush_icache(start);
++	return 0;
++}
++
++/*
++ * the slot path, shared by the verified and the raw entry points. the alias is
++ * opened per physical page and dropped again, and the caller holds g_patch_lock,
++ * so the slot is not shared and neither is the kernel patch slot. one slot serves
++ * any length: up to four bytes are written where the caller stands, longer runs
++ * park the cores first, which is what the kernel's own patcher does
++ */
++/*
++ * the slot path, with the translation the caller named. a null one means the
++ * library's own walk, which is the only one that is correct on a kernel whose
++ * vmalloc_to_page predates leaf handling, so it is the default of hk_write_fixmap
++ */
++/*
++ * the caller's translation, or the library's walk when it named none
++ */
++static unsigned long (*hk_write_to_pa(const struct hk_write *w))(unsigned long)
++{
++	if (w && w->to_pa)
++		return w->to_pa;
++	return hk_va_walk_pa;
++}
++
++/*
++ * the kernel's own poke slot, the same one its patcher maps through, so a platform
++ * that watches fixmap use sees what it expects. the target's own page is left
++ * alone: this is a mapping made here and it is writable whatever the target says
++ */
++static int hk_poke_run(struct hk_patch_job *job, const struct hk_write *w)
++{
++	unsigned long addr = job->addr;
++	const void *src = job->src;
++	size_t left = job->len;
++	int ret = 0;
++
++	lockdep_assert_held(&g_patch_lock);
++	cpus_read_lock();
++	while (left) {
++		unsigned long phys = hk_write_to_pa(w)(addr);
++		size_t chunk;
++		void *map;
++
++		if (!phys) {
++			ret = -ENOENT;
++			break;
++		}
++		chunk = min(left, PAGE_SIZE - (phys & ~PAGE_MASK));
++		ret = call_set_fixmap(FIX_TEXT_POKE0, phys & PAGE_MASK,
++				      PAGE_KERNEL);
++		if (ret)
++			break;
++		map = (void *)(__fix_to_virt(FIX_TEXT_POKE0) + (phys & ~PAGE_MASK));
++		if (w->nofault)
++			ret = (int)call_nofault_write(map, src, chunk);
++		else {
++			memcpy(map, src, chunk);
++			dsb(ish);
++		}
++		if (!ret)
++			ret = call_clean_inval(addr, addr + chunk);
++		call_set_fixmap(FIX_TEXT_POKE0, 0, __pgprot(0));
++		if (ret)
++			break;
++		addr += chunk;
++		src += chunk;
++		left -= chunk;
++	}
++	cpus_read_unlock();
++	return ret;
++}
++
++/*
++ * the page table entry that maps an address, and the level it was mapped at. a
++ * block mapping has no entry of its own, so the caller is told instead of being
++ * handed a descriptor of a different shape
++ */
++static pte_t *hk_va_pte(struct mm_struct *mm, unsigned long addr, int *level)
++{
++	pgd_t *pgd;
++	p4d_t *p4d;
++	pud_t *pud;
++	pmd_t *pmd;
++
++	pgd = pgd_offset(mm, addr);
++	if (pgd_none(*pgd) || pgd_bad(*pgd))
++		return NULL;
++	p4d = p4d_offset(pgd, addr);
++	if (p4d_none(*p4d) || p4d_bad(*p4d))
++		return NULL;
++#if defined(p4d_leaf)
++	if (p4d_leaf(*p4d)) {
++		*level = HK_WALK_P4D;
++		return NULL;
++	}
++#endif
++	pud = pud_offset(p4d, addr);
++	if (pud_none(*pud) || pud_bad(*pud))
++		return NULL;
++#if defined(pud_leaf)
++	if (pud_leaf(*pud)) {
++		*level = HK_WALK_PUD;
++		return NULL;
++	}
++#endif
++	pmd = pmd_offset(pud, addr);
++	if (pmd_none(*pmd))
++		return NULL;
++#if defined(pmd_leaf)
++	if (pmd_leaf(*pmd)) {
++		*level = HK_WALK_PMD;
++		return NULL;
++	}
++#endif
++	if (pmd_bad(*pmd))
++		return NULL;
++	*level = HK_WALK_PTE;
++	return pte_offset_kernel(pmd, addr);
++}
++
++/*
++ * the write bits of an entry, and only those: the read only bit is cleared and the
++ * software write bit is set, so what the store dirties is kept and the entry can be
++ * put back by clearing the write bits again. a caller whose kernel needs something
++ * else here names its own through the descriptor
++ */
++static pte_t hk_pte_make_write(const struct hk_write *w, pte_t pte)
++{
++	pteval_t bits;
++
++	if (w->mkwrite)
++		return w->mkwrite(pte);
++	bits = pte_val(pte);
++	bits &= ~PTE_RDONLY;
++	bits |= PTE_WRITE;
++	return __pte(bits);
++}
++
++/*
++ * the kernel side invalidation. an address space of the caller's own is its
++ * business, so its flush comes in through the descriptor
++ */
++static void hk_flush_tlb_page(unsigned long addr);
++
++static void hk_flush_va(const struct hk_write *w, struct mm_struct *mm,
++			unsigned long addr)
++{
++	if (w->flush)
++		w->flush(mm, addr);
++	else
++		hk_flush_tlb_page(addr);
++}
++
++static void hk_flush_tlb_page(unsigned long addr)
++{
++	__flush_tlb_kernel_pgtable(addr);
++	dsb(ish);
++	isb();
++}
++
++/*
++ * the target's own entry is made writable for the store and only that bit is put
++ * back, so the dirty and young bits the store sets are kept. a platform that
++ * watches fixmap use sees nothing here, which is what this route is for
++ */
++static int hk_own_run(void *dst, const void *src, size_t len,
++		      const struct hk_write *w,
++		      int (*fn)(void *ctx, void *addr, size_t len), void *ctx)
++{
++	struct mm_struct *mm = w->mm;
++	unsigned long addr = (unsigned long)dst;
++	int ret = 0;
++
++	if (!mm) {
++		mm = (struct mm_struct *)hk_resolve("init_mm");
++		if (!mm || !hk_ker_addr_ok((unsigned long)mm))
++			return -ENOENT;
++	}
++
++	/*
++	 * a caller that stores its own way gets one window over the page it named,
++	 * which is what a foreign address space needs, and the store is the whole of
++	 * it. the write bits are the only ones that move, so what the store dirties
++	 * is kept when the entry goes back
++	 */
++	while (len) {
++		unsigned long off = addr & ~PAGE_MASK;
++		size_t chunk = min(len, PAGE_SIZE - off);
++		int level = HK_WALK_PTE;
++		pte_t *ptep;
++
++		ptep = w->pte_of ? w->pte_of(mm, addr, &level) :
++				   hk_va_pte(mm, addr, &level);
++		pte_t old;
++		bool was_ro;
++
++		if (!ptep) {
++			ret = level == HK_WALK_PTE ? -ENOENT : -EOPNOTSUPP;
++			break;
++		}
++		old = READ_ONCE(*ptep);
++		was_ro = !pte_write(old);
++		WRITE_ONCE(*ptep, hk_pte_make_write(w, pte_mkdirty(old)));
++		hk_flush_va(w, mm, addr);
++		if (fn)
++			ret = fn(ctx, (void *)addr, chunk);
++		else if (w->nofault)
++			ret = call_nofault_write((void *)addr, src, chunk);
++		else {
++			memcpy((void *)addr, src, chunk);
++			dsb(ish);
++		}
++		if (was_ro)
++			WRITE_ONCE(*ptep, pte_wrprotect(READ_ONCE(*ptep)));
++		hk_flush_va(w, mm, addr);
++		if (!ret)
++			ret = call_clean_inval(addr, addr + chunk);
++		if (ret)
++			break;
++		addr += chunk;
++		src += chunk;
++		len -= chunk;
++	}
++	return ret;
++}
++
++int hk_write_window(void *dst, const void *src, size_t len,
++		    const struct hk_write *w,
++		    int (*fn)(void *ctx, void *addr, size_t len), void *ctx)
++{
++	struct hk_write o = { .slot = HK_SLOT_OWN };
++	int ret;
++
++	if (!dst || (!src && !fn) || (!len && !fn))
++		return -EINVAL;
++	if (w)
++		o = *w;
++	if (o.slot != HK_SLOT_OWN) {
++		if (fn)
++			return -EOPNOTSUPP;
++		return hk_write_run(dst, src, len, &o);
++	}
++	mutex_lock(&g_patch_lock);
++	ret = hk_own_run(dst, src, len, &o, fn, ctx);
++	mutex_unlock(&g_patch_lock);
++	if (!ret && !fn && o.verify && memcmp(dst, src, len))
++		ret = -EIO;
++	return ret;
++}
++
++int hk_write_run(void *dst, const void *src, size_t len,
++		 const struct hk_write *w)
++{
++	struct hk_write o = { };
++	int ret;
++
++	if (!dst || !src || !len)
++		return -EINVAL;
++	if (w)
++		o = *w;
++	if (o.slot == HK_SLOT_OWN) {
++		mutex_lock(&g_patch_lock);
++		ret = hk_own_run(dst, src, len, &o, NULL, NULL);
++		mutex_unlock(&g_patch_lock);
++	} else if (o.slot == HK_SLOT_KERNEL) {
++		struct hk_patch_job job = {
++			.addr = (unsigned long)dst,
++			.src = src,
++			.len = len,
++			.to_pa = hk_write_to_pa(&o),
++			.nofault = o.nofault,
++		};
++
++		mutex_lock(&g_patch_lock);
++		ret = hk_poke_run(&job, &o);
++		mutex_unlock(&g_patch_lock);
++	} else {
++		ret = hk_slot_write(dst, src, len, hk_write_to_pa(&o),
++				    o.nofault);
++	}
++	if (!ret && o.verify && memcmp(dst, src, len))
++		ret = -EIO;
++	return ret;
++}
++
++int hk_write_poke(void *dst, const void *src, size_t len)
++{
++	const struct hk_write w = { .slot = HK_SLOT_KERNEL,
++				    .nofault = true, .verify = true };
++
++	return hk_write_run(dst, src, len, &w);
++}
++
++static int hk_slot_write(void *dst, const void *src, size_t len,
++			unsigned long (*to_pa)(unsigned long va), bool nofault)
++{
++	struct hk_patch_job job;
++	unsigned long addr = (unsigned long)dst;
++	unsigned long caller = (unsigned long)__builtin_return_address(0);
++	int ret;
++
++	if (!dst || !src || !len || (len & 3))
++		return -EINVAL;
++
++	mutex_lock(&g_patch_lock);
++	ret = hk_patch_slot_index(&job.idx);
++	if (ret)
++		goto out;
++
++	job.addr = addr;
++	job.src = src;
++	job.len = len;
++	job.flags = 0;
++	job.caller = caller;
++	job.to_pa = to_pa ? to_pa : hk_va_walk_pa;
++	job.nofault = nofault;
++	atomic_set(&job.arrived, 0);
++	job.done = 0;
++	job.ret = 0;
++
++	if (len <= 4) {
++		ret = hk_patch_slot_run(addr, src, len, 0, job.idx, caller,
++					job.to_pa, nofault);
++	} else {
++		struct hk_patch_job saved = job;
++
++		ret = stop_machine(hk_patch_slot_cb, &job, cpu_online_mask);
++		if (ret)
++			pr_warn("[lkmhook] patch 0x%lx+%zu mode fixmap failed %d\n",
++				saved.addr, saved.len, ret);
++	}
++out:
++	mutex_unlock(&g_patch_lock);
++	return ret;
++}
++
++int hk_write_fixmap_by(void *dst, const void *src, size_t len,
++		       unsigned long (*to_pa)(unsigned long va))
++{
++	return hk_slot_write(dst, src, len, to_pa, false);
++}
++
++int hk_write_fixmap(void *dst, const void *src, size_t len)
++{
++	return hk_write_fixmap_by(dst, src, len, NULL);
++}
++
++/*
++ * false when the kernel's own patcher would send this address to a translation
++ * that cannot answer it. the engine asks this before it lets a consumer configured
++ * primitive touch its own memory
++ */
++bool hk_patch_kernel_primitive_ok(unsigned long addr)
++{
++	unsigned long phys = 0;
++	int level = HK_WALK_PTE;
++
++	/*
++	 * the kernel translates its own text arithmetically and never through
++	 * vmalloc_to_page, so text is safe whatever the mapping looks like
++	 */
++	if (hk_core_text(addr))
++		return true;
++	if (hk_walk_pa(addr, &phys, NULL, &level))
++		return true;
++	return level == HK_WALK_PTE;
++}
++
++/*
++ * the level an address is mapped at, for a caller that wants to judge a
++ * destination itself: 0 page, 1 pmd block, 2 pud block, 3 p4d block, -1 unknown
++ */
++int hk_va_kind(unsigned long va)
++{
++	unsigned long phys = 0;
++
++	if (hk_core_text(va))
++		return HK_VA_IMAGE_TEXT;
++	if (hk_kernel_image_addr(va))
++		return HK_VA_IMAGE_DATA;
++	if (!va)
++		return HK_VA_USER;
++	if (call_find_vm_area((const void *)va))
++		return HK_VA_VMALLOC;
++	if (hk_walk_pa(va, &phys, NULL, NULL) == 0)
++		return HK_VA_LINEAR;
++	if (va < TASK_SIZE)
++		return HK_VA_USER;
++	return HK_VA_LINEAR;
++}
++
++int hk_va_level(unsigned long va)
++{
++	unsigned long phys = 0;
++	int level = HK_WALK_PTE;
++
++	if (hk_walk_pa(va, &phys, NULL, &level))
++		return -1;
++	return level;
++}
++
++int hk_write_kernel(void *dst, const void *src, size_t len)
++{
++	unsigned long addr = (unsigned long)dst;
++
++	if (!dst || !src || !len || (len & 3))
++		return -EINVAL;
++	/*
++	 * the kernel sends everything that is not its own text to vmalloc_to_page,
++	 * and that cannot answer a block mapped address before 5.13: it warns and
++	 * returns a null page, which the patcher turns into BUG_ON. those addresses
++	 * go through the library's own walk instead, so no caller has to know and
++	 * nothing warns
++	 */
++	if (!hk_patch_kernel_primitive_ok(addr))
++		return hk_write_fixmap(dst, src, len);
++	return hk_insn_patch_run(addr, src, len);
++}
++
++int hk_write_one(void *dst, u32 insn)
++{
++	if (!dst)
++		return -EINVAL;
++	return hk_insn_write_run((unsigned long)dst, &insn, sizeof(insn));
++}
++
++/*
++ * the page is written where it is. the caller checked it with hk_va_writable,
++ * the library does not repeat the test
++ */
++int hk_write_direct(void *dst, const void *src, size_t len)
++{
++	if (!dst || !src || !len)
++		return -EINVAL;
++	memcpy(dst, (const void *)src, len);
++	dsb(ish);
++	return call_clean_inval((unsigned long)dst, (unsigned long)dst + len);
++}
++
++int hk_write_text(void *dst, const void *src, size_t len)
++{
++	if (g_write)
++		return g_write(dst, src, len);
++	return hk_write_kernel(dst, src, len);
++}
++
++/*
++ * called once by hk_init, in process context, with the write path the consumer
++ * configured. the library only records it
++ */
++void hk_patch_set_write(int (*write)(void *dst, const void *src, size_t len))
++{
++	g_write = write;
++}
++
++int hk_patch_write(void *dst, unsigned long val)
++{
++	return hk_write_text(dst, &val, sizeof(val));
++}
++
++void hk_patch_set_init(struct hk_patch_set *set)
++{
++	if (!set)
++		return;
++	INIT_LIST_HEAD(&set->hooks);
++	INIT_LIST_HEAD(&set->list);
++	set->count = 0;
++}
++
++unsigned int hk_patch_set_count(const struct hk_patch_set *set)
++{
++	return set ? set->count : 0;
++}
++
++/*
++ * the precheck. nothing is written, the current bytes are read through the
++ * nofault helper and kept with their checksum, and every reason an install could
++ * fail is answered here so the commit that follows has none left
++ */
++int hk_patch_prepare(struct hk_patch_set *set, struct hk_patch_hook *hook)
++{
++	unsigned long phys;
++	int ret;
++
++	if (!set || !hook || !hook->dst || !hook->src || !hook->len)
++		return -EINVAL;
++	if (hook->prepared || hook->active)
++		return -EALREADY;
++	if (hook->len > sizeof(hook->orig) || (hook->len & 3))
++		return -EINVAL;
++
++	ret = hk_translate((unsigned long)hook->dst, &phys);
++	if (ret) {
++		pr_warn("[lkmhook] prepare %s: 0x%lx does not translate, %d\n",
++			hook->name ? hook->name : "?",
++			(unsigned long)hook->dst, ret);
++		return ret;
++	}
++	if (copy_from_kernel_nofault(hook->orig, hook->dst, hook->len)) {
++		pr_warn("[lkmhook] prepare %s: site is not readable\n",
++			hook->name ? hook->name : "?");
++		return -EFAULT;
++	}
++	hook->checksum = crc32_le(~0U, hook->orig, hook->len);
++	hook->prepared = true;
++	hook->active = false;
++	if (!hook->list.next) {
++		list_add_tail(&hook->list, &set->hooks);
++		set->count++;
++	}
++	return 0;
++}
++
++/*
++ * the commit. every site is compared against the bytes the prepare saw before
++ * the first write, so a site another writer took is reported while nothing has
++ * changed. a write that fails after that point puts the sites already written
++ * back and reports the failure, so a set is either all in or all out
++ */
++int hk_patch_commit(struct hk_patch_set *set)
++{
++	struct hk_patch_hook *hook;
++	struct hk_patch_hook *failed = NULL;
++	u8 seen[HK_PATCH_INSNS_MAX * 4];
++	int ret = 0;
++
++	if (!set)
++		return -EINVAL;
++
++	list_for_each_entry(hook, &set->hooks, list) {
++		if (!hook->prepared) {
++			pr_warn("[lkmhook] commit %s: not prepared\n",
++				hook->name ? hook->name : "?");
++			return -EINVAL;
++		}
++		if (copy_from_kernel_nofault(seen, hook->dst, hook->len)) {
++			pr_warn("[lkmhook] commit %s: site is not readable\n",
++				hook->name ? hook->name : "?");
++			return -EFAULT;
++		}
++		if (crc32_le(~0U, seen, hook->len) != hook->checksum) {
++			pr_warn("[lkmhook] commit %s: site changed since prepare\n",
++				hook->name ? hook->name : "?");
++			return -EAGAIN;
++		}
++	}
++
++	list_for_each_entry(hook, &set->hooks, list) {
++		ret = hk_write_text(hook->dst, hook->src, hook->len);
++		if (ret) {
++			failed = hook;
++			break;
++		}
++		hook->active = true;
++	}
++	if (!ret)
++		return 0;
++
++	list_for_each_entry(hook, &set->hooks, list) {
++		if (hook == failed)
++			break;
++		hk_write_text(hook->dst, hook->orig, hook->len);
++		hook->active = false;
++	}
++	pr_warn("[lkmhook] commit rolled back at %s, %d\n",
++		failed && failed->name ? failed->name : "?", ret);
++	return ret;
++}
++
++int hk_patch_rollback(struct hk_patch_set *set)
++{
++	struct hk_patch_hook *hook;
++	int first = 0;
++
++	if (!set)
++		return -EINVAL;
++
++	list_for_each_entry(hook, &set->hooks, list) {
++		int ret;
++
++		if (!hook->active)
++			continue;
++		ret = hk_write_text(hook->dst, hook->orig, hook->len);
++		if (ret) {
++			pr_warn("[lkmhook] rollback %s failed %d\n",
++				hook->name ? hook->name : "?", ret);
++			if (!first)
++				first = ret;
++			continue;
++		}
++		hook->active = false;
++	}
++	return first;
++}
++
++void hk_patch_set_release(struct hk_patch_set *set)
++{
++	struct hk_patch_hook *hook;
++	struct hk_patch_hook *tmp;
++
++	if (!set)
++		return;
++	list_for_each_entry_safe(hook, tmp, &set->hooks, list) {
++		list_del(&hook->list);
++		hook->prepared = false;
++		set->count--;
++	}
++	INIT_LIST_HEAD(&set->hooks);
++	set->count = 0;
++}
+diff --git a/glue/hk/hk_patch.h b/glue/hk/hk_patch.h
+new file mode 100644
+index 0000000..6ce7664
+--- /dev/null
++++ b/glue/hk/hk_patch.h
+@@ -0,0 +1,199 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2026 dere3046
++ */
++
++#ifndef LKMHOOK_HK_PATCH_H
++#define LKMHOOK_HK_PATCH_H
++
++#include <linux/list.h>
++#include <linux/types.h>
++
++#define HK_PATCH_INSNS_MAX 32
++
++/*
++ * writing kernel text. the library owns the mechanisms and nothing else: which
++ * one a call takes is decided at the call site, and whether a write is verified
++ * before it lands is decided there too. there is no mode word and no process
++ * wide setting, so one look at a call tells the whole story
++ *
++ * every primitive writes len bytes at dst, cleans the data cache over the range
++ * and invalidates the instruction cache, and leaves no mapping behind on any
++ * path, including the failing ones. the return value is 0 or a negative errno
++ *
++ * hk_write_kernel is the kernel's own aarch64_insn_patch_text: it parks the cores
++ * and maps through the kernel's own fixmap frame, so it assumes nothing about the
++ * headers this module was built with. hk_write_fixmap maps a slot of this build
++ * itself, which is the byte wide path and the faster one.
++ * hk_write_direct stores where the kernel already mapped the page writable, and
++ * hk_va_writable is the test that says whether that is the case
++ *
++ * a caller that wants a fallback, a retry, or a permanent switch of path writes
++ * that in its own wrapper. the library keeps no such state
++ */
++int hk_write_text(void *dst, const void *src, size_t len);
++int hk_write_kernel(void *dst, const void *src, size_t len);
++int hk_write_one(void *dst, u32 insn);
++/*
++ * what one write is made of. every field is the caller's choice: a translation of
++ * its own or one of the library's, the library's slot or the kernel's, a plain
++ * store or a fault tolerant one, and whether the result has to be read back. a
++ * zeroed descriptor is the library's own route and the read back is off
++ */
++#define HK_SLOT_LIBRARY 0
++#define HK_SLOT_KERNEL 1
++#define HK_SLOT_OWN 2
++
++struct hk_write {
++	struct mm_struct *mm;
++	unsigned long (*to_pa)(unsigned long va);
++	void (*flush)(struct mm_struct *mm, unsigned long va);
++	pte_t (*mkwrite)(pte_t pte);
++	/*
++	 * the same freedom the alias routes give through to_pa, for the route that writes
++	 * through the target's own entry: it has to find that entry first, and a caller
++	 * that wants to find it its own way says so here. a null one is the library's own
++	 * walk, and the library neither checks nor second guesses what it is given
++	 */
++	pte_t *(*pte_of)(struct mm_struct *mm, unsigned long va, int *level);
++	int slot;
++	bool nofault;
++	bool verify;
++};
++
++int hk_write_run(void *dst, const void *src, size_t len,
++		 const struct hk_write *w);
++int hk_write_poke(void *dst, const void *src, size_t len);
++/*
++ * the write bits of a mapping held open for a caller that stores its own way. a null
++ * fn means the store is done here through the same descriptor, so a caller with a
++ * foreign address space runs its own store inside and a caller with one of its own
++ * takes the store here
++ */
++int hk_write_window(void *dst, const void *src, size_t len,
++		    const struct hk_write *w,
++		    int (*fn)(void *ctx, void *addr, size_t len), void *ctx);
++int hk_write_fixmap(void *dst, const void *src, size_t len);
++int hk_write_fixmap_by(void *dst, const void *src, size_t len,
++		       unsigned long (*to_pa)(unsigned long va));
++int hk_write_direct(void *dst, const void *src, size_t len);
++
++/*
++ * what a caller needs to judge a destination itself. the frame test the verified
++ * slot path runs is the same one hk_va_maps answers
++ */
++unsigned long hk_va_to_pa(unsigned long va);
++unsigned long hk_va_walk_pa(unsigned long va);
++/*
++ * which family an address belongs to. the family is what decides how a write has to
++ * be made, so a caller that wants to choose its own route asks this first instead of
++ * guessing from the value. the library never uses it to pick a route by itself
++ */
++enum hk_va_kind {
++	HK_VA_IMAGE_TEXT = 0,	/* the kernel's own patcher translates this arithmetically */
++	HK_VA_IMAGE_DATA,	/* image rodata and data: its patcher sends these to vmalloc_to_page */
++	HK_VA_LINEAR,		/* the linear map: read only data has a read only alias here too */
++	HK_VA_VMALLOC,		/* vmalloc and module memory */
++	HK_VA_USER,
++};
++
++int hk_va_kind(unsigned long va);
++int hk_va_level(unsigned long va);
++bool hk_va_writable(unsigned long va);
++/*
++ * one address, every fact a caller needs to choose a route itself. this is the
++ * queries above together, for a layer that wants to decide once instead of asking
++ * four times: the library never picks a route from it. the protection a vendor
++ * kernel puts on a page shows up as writable being false while the address still
++ * translates, and a block mapping as level above zero, which is the shape a page
++ * table write cannot take
++ */
++struct hk_route {
++	int kind;		/* enum hk_va_kind of the address */
++	int level;		/* walk level, above zero means a block mapping */
++	bool block_map;		/* no pte to change, text writes still work */
++	bool writable;		/* writable through the current page table */
++	bool maps;		/* the entry carries the frame the address translates to */
++};
++
++/*
++ * fill one of these in. nothing is written, nothing is installed: it reads the page
++ * table and answers what it found. a protection this library has no name for shows
++ * up as a false in the record, which is the honest answer to a caller that wanted
++ * to know whether its own route stands a chance. the breakpoint gates are a
++ * question of their own, hk_kprobe_check_at, so a caller that wants both asks both
++ */
++int hk_route_probe(unsigned long addr, struct hk_route *out);
++bool hk_va_maps(unsigned long va, unsigned long pa);
++bool hk_va_maps_by(unsigned long va, unsigned long pa,
++		   unsigned long (*to_pa)(unsigned long va));
++
++void hk_flush_icache(unsigned long addr);
++void hk_flush_dcache(unsigned long addr, size_t len);
++
++/*
++ * one patch site a transaction covers. the raw bytes read at prepare time are
++ * kept and checksummed, the commit refuses to write when the bytes at the
++ * address changed since, so a site another writer already took is reported
++ * instead of being overwritten
++ */
++struct hk_patch_hook {
++	struct list_head list;
++	const char *name;
++	void *dst;
++	const void *src;
++	size_t len;
++	int flags;
++	u8 orig[HK_PATCH_INSNS_MAX * 4];
++	u32 checksum;
++	bool prepared;
++	bool active;
++};
++
++struct hk_patch_set {
++	struct list_head hooks;
++	struct list_head list;
++	unsigned int count;
++};
++
++/*
++ * the transaction writes through the path hk_init was configured with, one word
++ * at a time, and a hook carries no mode of its own
++ */
++void hk_patch_set_init(struct hk_patch_set *set);
++void hk_patch_set_release(struct hk_patch_set *set);
++int hk_patch_prepare(struct hk_patch_set *set, struct hk_patch_hook *hook);
++int hk_patch_commit(struct hk_patch_set *set);
++int hk_patch_rollback(struct hk_patch_set *set);
++unsigned int hk_patch_set_count(const struct hk_patch_set *set);
++
++/*
++ * the configured path for one unsigned long, which is what a table entry needs
++ */
++int hk_patch_write(void *dst, unsigned long val);
++
++/*
++ * called by hk_init, not by consumers: resolve what the primitives need, in
++ * process context, and record the configured write path
++ */
++/*
++ * what a consumer compiles in is its own build decision. setting the flag leaves
++ * this module out of the link, and the calls the core makes into it become
++ * nothing, while the entry points of the module itself stay declared: calling one
++ * of those without its object is a link error, never a silent no op
++ */
++#ifdef HK_NO_PATCH
++static inline void hk_patch_init(void) { }
++static inline void hk_patch_set_write(int (*write)(void *dst, const void *src,
++						   size_t len))
++{
++	(void)write;
++}
++#else
++void hk_patch_init(void);
++bool hk_patch_kernel_primitive_ok(unsigned long addr);
++void hk_patch_set_write(int (*write)(void *dst, const void *src,
++				    size_t len));
++#endif
++
++#endif
+diff --git a/glue/hk/hk_ptr.c b/glue/hk/hk_ptr.c
+new file mode 100644
+index 0000000..b1ec285
+--- /dev/null
++++ b/glue/hk/hk_ptr.c
+@@ -0,0 +1,175 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2026 dere3046
++ */
++
++#include <linux/list.h>
++#include <linux/module.h>
++#include <linux/printk.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++
++#include "hk_patch.h"
++#include "hk_ptr.h"
++
++struct hk_ptr_entry {
++	struct list_head list;
++	void **slot;
++	void *orig;
++};
++
++static LIST_HEAD(g_ptrs);
++/* the entries whose restore failed, kept for hk_ptr_exit to retry */
++static LIST_HEAD(g_ptr_broken);
++static DEFINE_SPINLOCK(g_ptr_lock);
++
++unsigned int hk_ptr_pending(void)
++{
++	unsigned int count = 0;
++	struct hk_ptr_entry *ent;
++	unsigned long flags;
++
++	spin_lock_irqsave(&g_ptr_lock, flags);
++	list_for_each_entry(ent, &g_ptr_broken, list)
++		count++;
++	spin_unlock_irqrestore(&g_ptr_lock, flags);
++	return count;
++}
++
++int hk_ptr_hook(void **slot, void *replacement, void **orig_out)
++{
++	struct hk_ptr_entry *ent;
++	struct hk_ptr_entry *new;
++	unsigned long flags;
++	void *orig;
++	int ret;
++
++	if (!slot || !replacement)
++		return -EINVAL;
++
++	new = kzalloc(sizeof(*new), GFP_KERNEL);
++	if (!new)
++		return -ENOMEM;
++
++	/*
++	 * the entry is reserved before the write and the lock is dropped for it,
++	 * because the write opens a fixmap and sleeps. the slot is taken from
++	 * here, so a second hook cannot race the write and lose an original, and
++	 * a failed write drops the reservation again
++	 */
++	spin_lock_irqsave(&g_ptr_lock, flags);
++	list_for_each_entry(ent, &g_ptrs, list) {
++		if (ent->slot != slot)
++			continue;
++		spin_unlock_irqrestore(&g_ptr_lock, flags);
++		kfree(new);
++		return -EEXIST;
++	}
++	list_for_each_entry(ent, &g_ptr_broken, list) {
++		if (ent->slot != slot)
++			continue;
++		spin_unlock_irqrestore(&g_ptr_lock, flags);
++		kfree(new);
++		return -EEXIST;
++	}
++	if (copy_from_kernel_nofault(&orig, slot, sizeof(orig))) {
++		spin_unlock_irqrestore(&g_ptr_lock, flags);
++		kfree(new);
++		return -EFAULT;
++	}
++	new->slot = slot;
++	new->orig = orig;
++	list_add(&new->list, &g_ptrs);
++	spin_unlock_irqrestore(&g_ptr_lock, flags);
++
++	ret = hk_patch_write(slot, (unsigned long)replacement);
++	if (!ret) {
++		void *now;
++
++		/*
++		 * the slot is read back before the hook is reported as taken: a write a
++		 * platform swallowed leaves the pointer where it was, and a caller has to
++		 * hear about that rather than believe the hook is in place
++		 */
++		if (copy_from_kernel_nofault(&now, slot, sizeof(now)) ||
++		    now != replacement)
++			ret = -EIO;
++	}
++	if (ret) {
++		spin_lock_irqsave(&g_ptr_lock, flags);
++		list_del(&new->list);
++		spin_unlock_irqrestore(&g_ptr_lock, flags);
++		kfree(new);
++		return ret;
++	}
++
++	if (orig_out)
++		*orig_out = orig;
++	pr_info("[lkmhook] ptr hook %px -> %ps\n", slot, replacement);
++	return 0;
++}
++
++void hk_ptr_unhook(void **slot)
++{
++	struct hk_ptr_entry *ent;
++	struct hk_ptr_entry *tmp;
++	struct hk_ptr_entry *found = NULL;
++	unsigned long flags;
++	int ret;
++
++	if (!slot)
++		return;
++
++	/*
++	 * the entry leaves the live list before the write, so a hook installed
++	 * while the restore sleeps takes the slot, reads the replacement as its
++	 * own original and is correct. a restore that fails is kept for the exit
++	 * gate instead of being dropped, the slot still points at module memory
++	 */
++	spin_lock_irqsave(&g_ptr_lock, flags);
++	list_for_each_entry_safe(ent, tmp, &g_ptrs, list) {
++		if (ent->slot != slot)
++			continue;
++		list_del(&ent->list);
++		found = ent;
++		break;
++	}
++	spin_unlock_irqrestore(&g_ptr_lock, flags);
++
++	if (!found)
++		return;
++	ret = hk_patch_write(slot, (unsigned long)found->orig);
++	if (ret) {
++		pr_warn("[lkmhook] ptr unhook %px failed %d\n", slot, ret);
++		spin_lock_irqsave(&g_ptr_lock, flags);
++		list_add(&found->list, &g_ptr_broken);
++		spin_unlock_irqrestore(&g_ptr_lock, flags);
++		return;
++	}
++	kfree(found);
++}
++
++void hk_ptr_exit(void)
++{
++	struct hk_ptr_entry *ent;
++	struct hk_ptr_entry *tmp;
++	LIST_HEAD(work);
++	unsigned long flags;
++
++	spin_lock_irqsave(&g_ptr_lock, flags);
++	list_splice_init(&g_ptrs, &work);
++	list_splice_init(&g_ptr_broken, &work);
++	spin_unlock_irqrestore(&g_ptr_lock, flags);
++
++	list_for_each_entry_safe(ent, tmp, &work, list) {
++		list_del(&ent->list);
++		if (hk_patch_write(ent->slot, (unsigned long)ent->orig)) {
++			pr_warn("[lkmhook] ptr restore %px failed\n", ent->slot);
++			spin_lock_irqsave(&g_ptr_lock, flags);
++			list_add(&ent->list, &g_ptr_broken);
++			spin_unlock_irqrestore(&g_ptr_lock, flags);
++			continue;
++		}
++		kfree(ent);
++	}
++}
+diff --git a/glue/hk/hk_ptr.h b/glue/hk/hk_ptr.h
+new file mode 100644
+index 0000000..74a09c4
+--- /dev/null
++++ b/glue/hk/hk_ptr.h
+@@ -0,0 +1,46 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2026 dere3046
++ */
++
++#ifndef LKMHOOK_HK_PTR_H
++#define LKMHOOK_HK_PTR_H
++
++#include <linux/types.h>
++
++/*
++ * swap the pointer at slot for replacement and record the original for
++ * hk_ptr_unhook or hk_ptr_exit. the duplicate check and the record are under one
++ * spinlock and the swap is not: the swap goes through the fixmap and a fixmap
++ * open sleeps, so it runs from an entry already reserved under the lock. a slot
++ * is taken from the moment it is reserved, a second hook on it is -EEXIST
++ *
++ * the hooks live in a list, there is no fixed capacity and no -ENOSPC. the walk
++ * over the live hooks costs the same as the old table scan. the tracking entry is
++ * allocated, so this runs in process context, and -ENOMEM is the new full case
++ *
++ * -EINVAL on a NULL slot or replacement, -EEXIST when the slot is already hooked,
++ * -EFAULT when the slot cannot be read, -EIO when the write fails
++ */
++int hk_ptr_hook(void **slot, void *replacement, void **orig_out);
++
++/* restore the recorded original, silent when the slot is not hooked */
++void hk_ptr_unhook(void **slot);
++
++/*
++ * what a consumer compiles in is its own build decision. setting the flag leaves
++ * this module out of the link, and the calls the core makes into it become
++ * nothing, while the entry points of the module itself stay declared: calling one
++ * of those without its object is a link error, never a silent no op
++ */
++#ifdef HK_NO_PTR
++static inline void hk_ptr_exit(void) { }
++static inline unsigned int hk_ptr_pending(void) { return 0; }
++#else
++/* restore every tracked slot, called by hk_exit */
++void hk_ptr_exit(void);
++
++/* slots whose original could not be written back, counted for the exit gate */
++unsigned int hk_ptr_pending(void);
++#endif
++#endif
+diff --git a/glue/hk/hk_redir.c b/glue/hk/hk_redir.c
+new file mode 100644
+index 0000000..8a08e80
+--- /dev/null
++++ b/glue/hk/hk_redir.c
+@@ -0,0 +1,350 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2026 dere3046
++ */
++
++#include <linux/atomic.h>
++#include <linux/delay.h>
++#include <linux/errno.h>
++#include <linux/kprobes.h>
++#include <linux/module.h>
++#include <linux/printk.h>
++#include <linux/sched.h>
++#include <linux/types.h>
++#include <linux/xarray.h>
++
++#include "hk.h"
++#include "hk_inline.h"
++#include "hk_kprobe.h"
++#include "hk_kretprobe.h"
++#include "hk_redir.h"
++
++/* how long a remove waits for the calls inside a replacement to come back */
++#define HK_REDIR_DRAIN_MS 100
++
++/*
++ * the calls inside a replacement and the reference they hold belong to the module
++ * this library was built into, not to one hook: the module is what must not be
++ * freed, and every hook of a module protects the same one
++ */
++static atomic_t g_redir_inflight = ATOMIC_INIT(0);
++static unsigned int g_redir_stuck;
++
++/*
++ * resolved once, at install time and in process context: a kallsyms walk from a
++ * breakpoint handler would be a walk on every redirected call
++ */
++typedef bool (*module_get_fn)(struct module *mod);
++typedef void (*module_put_fn)(struct module *mod);
++
++static module_get_fn g_module_get;
++static module_put_fn g_module_put;
++
++static int hk_redir_pin_resolve(void)
++{
++	if (!g_module_get)
++		g_module_get = (module_get_fn)hk_resolve("try_module_get");
++	if (!g_module_put)
++		g_module_put = (module_put_fn)hk_resolve("module_put");
++	if (!g_module_get || !g_module_put)
++		return -ENODATA;
++	return 0;
++}
++
++static __nocfi bool hk_redir_get_ref(void)
++{
++	if (!g_module_get || !THIS_MODULE)
++		return false;
++	return g_module_get(THIS_MODULE);
++}
++
++static __nocfi void hk_redir_put_ref(void)
++{
++	if (!g_module_put || !THIS_MODULE)
++		return;
++	g_module_put(THIS_MODULE);
++}
++
++/* the completion signal: the replacement returned, so one reference goes back */
++static int hk_redir_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
++{
++	(void)ri;
++	(void)regs;
++	atomic_dec(&g_redir_inflight);
++	hk_redir_put_ref();
++	return 0;
++}
++
++/*
++ * the handler of every kprobe route hook. the probe is a member of the hook, so the
++ * hook is what encloses it and one handler serves all of them
++ */
++static int hk_redir_pre(struct kprobe *p, struct pt_regs *regs)
++{
++	struct hk_redir *r = container_of(p, struct hk_redir, u.kprobe.kp);
++	bool pinned = false;
++
++	if (!READ_ONCE(r->live))
++		return 0;
++
++	/*
++	 * the reference comes before the marker is set: a task that cannot be pinned
++	 * must not be marked as redirected either, or it would never be redirected
++	 * again
++	 */
++	if (r->pin) {
++		if (!hk_redir_get_ref())
++			return 0;
++		pinned = true;
++	}
++
++	if (r->guard == HK_REDIR_GUARD_CALLER) {
++		/*
++		 * the return address says who called: a call from the module the hook
++		 * lives in is the replacement reaching for the original, which is what
++		 * the original instruction has to run for
++		 */
++		if (within_module(regs->regs[30], THIS_MODULE)) {
++			if (pinned)
++				hk_redir_put_ref();
++			return 0;
++		}
++	} else if (!hk_redir_guard_enter(r)) {
++		if (pinned)
++			hk_redir_put_ref();
++		return 0;
++	}
++
++	if (pinned)
++		atomic_inc(&g_redir_inflight);
++	hk_regs_redirect(regs, READ_ONCE(r->repl));
++	return 1;
++}
++
++bool hk_redir_guard_enter(struct hk_redir *r)
++{
++	void *old;
++
++	if (!r || !READ_ONCE(r->live))
++		return false;
++	/* the caller marker keeps no state, so there is nothing to enter */
++	if (r->guard != HK_REDIR_GUARD_TASK)
++		return true;
++	if (xa_load(&r->tasks, (unsigned long)current))
++		return false;
++	/*
++	 * the node comes from atomic memory on purpose: the handler runs with the
++	 * probed core parked, and a sleeping allocation here is the bug this replaces
++	 */
++	old = xa_store(&r->tasks, (unsigned long)current, r, GFP_ATOMIC);
++	return !xa_is_err(old);
++}
++
++void hk_redir_leave(struct hk_redir *r)
++{
++	if (!r || r->guard != HK_REDIR_GUARD_TASK)
++		return;
++	xa_erase(&r->tasks, (unsigned long)current);
++}
++
++/*
++ * wait for the calls that are already inside a replacement to come back. the probe
++ * is gone by the time this runs, so no new call starts and the count can only
++ * fall. a replacement that never returns is reported instead of being waited for
++ */
++static int hk_redir_drain(void)
++{
++	unsigned int i;
++
++	for (i = 0; i < HK_REDIR_DRAIN_MS; i++) {
++		if (!atomic_read(&g_redir_inflight))
++			return 0;
++		msleep(1);
++	}
++	return -EBUSY;
++}
++
++static void hk_redir_stuck(void)
++{
++	g_redir_stuck++;
++}
++
++int hk_redir_install_at(struct hk_redir *r, unsigned long addr,
++			unsigned long repl, enum hk_redir_how how)
++{
++	enum hk_redir_guard guard;
++	bool pin;
++	int ret;
++
++	if (!r || !addr || !repl)
++		return -EINVAL;
++	/* the text route writes an entry it has to read and relocate first */
++	if (how != HK_REDIR_KPROBE)
++		return -EOPNOTSUPP;
++	if (r->guard != HK_REDIR_GUARD_TASK && r->guard != HK_REDIR_GUARD_CALLER)
++		return -EINVAL;
++
++	/* what the caller named before the call, everything else is set here */
++	pin = r->pin;
++	guard = r->guard;
++
++	memset(r, 0, sizeof(*r));
++	r->how = how;
++	r->guard = guard;
++	r->pin = pin;
++	r->addr = addr;
++	r->orig = addr;
++	r->repl = repl;
++	xa_init(&r->tasks);
++
++	if (pin) {
++		/*
++		 * a pin that cannot be completed is refused, not dropped: a hook that
++		 * redirects without holding the reference would let the module be freed
++		 * under a call that is still running
++		 */
++		ret = hk_redir_pin_resolve();
++		if (ret)
++			return ret;
++		/*
++		 * the signal is armed before the redirect, so no call can be redirected
++		 * without the reference that accounts for it
++		 */
++		ret = hk_kretprobe_install_at(&r->retprobe, repl, hk_redir_ret);
++		if (ret)
++			return ret;
++	}
++
++	/*
++	 * live before the probe is armed: a call can be redirected the moment
++	 * register_kprobe returns, and the handler has to see a hook it may enter
++	 */
++	r->live = true;
++	ret = hk_kprobe_install_at(&r->u.kprobe, addr, hk_redir_pre);
++	if (ret) {
++		r->live = false;
++		if (pin)
++			hk_kretprobe_remove(&r->retprobe);
++		xa_destroy(&r->tasks);
++		return ret;
++	}
++	return 0;
++}
++
++int hk_redir_install(struct hk_redir *r, const char *sym, const char *repl_sym,
++		     enum hk_redir_how how)
++{
++	unsigned long addr;
++	unsigned long repl;
++	int ret;
++
++	if (!r || !sym || !repl_sym)
++		return -EINVAL;
++
++	if (how == HK_REDIR_TEXT) {
++#ifdef HK_NO_INLINE
++		/* the entry writer is not part of this build, so there is no text route */
++		return -EOPNOTSUPP;
++#else
++		/* neither of the two is a mechanism the entry writer has */
++		if (r->pin || r->guard != HK_REDIR_GUARD_TASK)
++			return -EOPNOTSUPP;
++
++		memset(r, 0, sizeof(*r));
++		r->how = how;
++		r->name = sym;
++		r->repl = hk_resolve(repl_sym);
++		if (!r->repl)
++			return -ENOENT;
++		ret = hk_inline_hook(&r->u.text, sym, repl_sym);
++		if (ret)
++			return ret;
++		r->addr = r->u.text.addr;
++		r->orig = r->u.text.orig;
++		r->live = true;
++		return 0;
++#endif
++	}
++
++	addr = hk_resolve(sym);
++	if (!addr)
++		return -ENOENT;
++	repl = hk_resolve(repl_sym);
++	if (!repl)
++		return -ENOENT;
++
++	ret = hk_redir_install_at(r, addr, repl, how);
++	if (ret)
++		return ret;
++	r->name = sym;
++	return 0;
++}
++
++int hk_redir_remove(struct hk_redir *r)
++{
++	int ret;
++
++	/* a hook that could not be taken back is retried, one that is gone is not */
++	if (!r || (!r->live && !r->pending))
++		return -EINVAL;
++
++	/* from here on a breakpoint that fires runs the original */
++	WRITE_ONCE(r->live, false);
++
++	if (r->how == HK_REDIR_TEXT) {
++#ifndef HK_NO_INLINE
++		/* the disable, the grace period and the free, in that order */
++		hk_inline_unhook(&r->u.text);
++#endif
++		return 0;
++	}
++
++	ret = hk_kprobe_remove(&r->u.kprobe);
++	if (ret) {
++		r->pending = true;
++		hk_redir_stuck();
++		return ret;
++	}
++
++	if (r->pin) {
++		/*
++		 * the signal stays armed until the calls it accounts for are done: a
++		 * signal unregistered with an instance still in flight would drop the
++		 * reference that instance still owes
++		 */
++		ret = hk_redir_drain();
++		if (!ret)
++			ret = hk_kretprobe_remove(&r->retprobe);
++		if (ret) {
++			r->pending = true;
++			hk_redir_stuck();
++			return ret;
++		}
++	} else {
++		/*
++		 * the probe is gone, so no new call can be redirected, but a core that
++		 * was already inside the replacement is still there and still owns an
++		 * entry in the marker. the grace period is what it takes for that core
++		 * to be out, the same wait hk_inline does before it frees a trampoline
++		 */
++		hk_wait_tasks_rcu();
++	}
++
++	xa_destroy(&r->tasks);
++	if (r->pending) {
++		r->pending = false;
++		if (g_redir_stuck)
++			g_redir_stuck--;
++	}
++	return 0;
++}
++
++unsigned int hk_redir_pending(void)
++{
++	return READ_ONCE(g_redir_stuck);
++}
++
++unsigned int hk_redir_inflight(void)
++{
++	return (unsigned int)atomic_read(&g_redir_inflight);
++}
+diff --git a/glue/hk/hk_redir.h b/glue/hk/hk_redir.h
+new file mode 100644
+index 0000000..49d4120
+--- /dev/null
++++ b/glue/hk/hk_redir.h
+@@ -0,0 +1,166 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2026 dere3046
++ */
++
++#ifndef LKMHOOK_HK_REDIR_H
++#define LKMHOOK_HK_REDIR_H
++
++#include <linux/types.h>
++#include <linux/xarray.h>
++
++#include "hk_inline.h"
++#include "hk_kprobe.h"
++#include "hk_kretprobe.h"
++
++/*
++ * running another function in place of a kernel function, which is what a consumer
++ * that changes behaviour needs and what a probe alone cannot give it. the caller
++ * names the target, the replacement and the mechanism, and the library keeps no
++ * opinion about which mechanism suits which target: hk_inline_probe and
++ * hk_kprobe_check answer that before anything is written
++ *
++ * hk_redir_text writes the entry of the target. it takes both sides by name,
++ * because a branch is written to the address the resolver answers, cfi suffix
++ * included, and because the entry has to be judged and relocated first. the
++ * original is the trampoline hk_inline builds, reached through hk_redir.orig, and
++ * nothing has to be done about entering the target again: that trampoline is a
++ * copy of the entry
++ *
++ * hk_redir_kprobe leaves the entry alone and arms a breakpoint on it, so a target
++ * another core is executing can still be redirected, and a page that cannot be
++ * written at all is still a target. it takes a symbol or an address on either
++ * side, so a syscall table entry the caller read itself is redirected the same way
++ * a symbol is. the replacement runs with the argument registers of the target, on
++ * the caller stack of the target, and returns to the caller of the target
++ *
++ * the marker, kprobe route only. a replacement reaches the original by calling
++ * hk_redir.orig, which is the probed entry itself: the breakpoint fires again and
++ * the handler has to let that call through instead of redirecting it a second
++ * time. which calls are let through is the caller's choice, made before the
++ * install:
++ *
++ *	HK_REDIR_GUARD_TASK	the handler marks the task it redirected, and the
++ *				replacement clears the mark through hk_redir_leave.
++ *				a replacement that never clears it stops being
++ *				redirected for that task and the original runs from
++ *				then on, which is a lost hook and not a crash
++ *	HK_REDIR_GUARD_CALLER	the handler reads the return address and lets a
++ *				call from the module this library was built into
++ *				through. no state, nothing to clear, and a call the
++ *				owning module makes on purpose is not redirected
++ *				either. hk_redir_leave has nothing to do here
++ *
++ * a task marker costs one xarray entry per task that passes and needs the leave
++ * call in every replacement. a caller marker is free and cannot be forgotten, and
++ * it reads the return address, so it cannot tell a pass through from a deliberate
++ * call by the same module
++ *
++ * the pin, kprobe route only, asked for before the install. while a redirected
++ * call is inside a replacement, the module this library was built into is held
++ * with a reference, taken in the handler and dropped by a kretprobe the library
++ * arms on the replacement itself. the kernel's own delete_module refuses to
++ * unload a module whose reference count is not zero, so the module cannot go away
++ * under a call that is still running, and hk_redir_inflight reports how many such
++ * calls are inside right now. a pin that cannot be completed is refused instead
++ * of being dropped, and it costs one more trap per redirected call. the counter
++ * and the reference belong to the module, not to one hook, because the module is
++ * what must not be freed
++ *
++ *	__nocfi long my_target(int a)
++ *	{
++ *		long ret = my_orig(a);		my_orig is hk_redir.orig
++ *
++ *		hk_redir_leave(&r);
++ *		return ret + 1;
++ *	}
++ *
++ * a build that leaves the inline group out has no text route at all: the install
++ * answers -EOPNOTSUPP for HK_REDIR_TEXT, the same answer the address route gives to
++ * a mechanism the caller did not link in
++ *
++ * a refused install returns what its route reports, -EINVAL for a null argument,
++ * -EOPNOTSUPP for a route that cannot take what it was given, and -ENODATA for a
++ * pin whose kernel entry points cannot be resolved: the text route reports what
++ * hk_inline_hook reports, the kprobe route what register_kprobe reports, which is
++ * -EINVAL for every address gate
++ */
++
++enum hk_redir_how {
++	HK_REDIR_TEXT = 0,	/* the entry is written, the target must not be running */
++	HK_REDIR_KPROBE,	/* the entry keeps its bytes, a breakpoint carries the call */
++};
++
++enum hk_redir_guard {
++	HK_REDIR_GUARD_TASK = 0,	/* the per task marker, cleared by hk_redir_leave */
++	HK_REDIR_GUARD_CALLER,		/* the return address, nothing to clear */
++};
++
++struct hk_redir {
++	enum hk_redir_how how;
++	enum hk_redir_guard guard;	/* read before the install, zero is the task marker */
++	bool pin;			/* read before the install, see the pin note */
++	const char *name;		/* the target as it was named, null for an address */
++	unsigned long addr;		/* the entry a call lands on */
++	unsigned long orig;		/* what a replacement calls to reach the original */
++	unsigned long repl;		/* what a redirected call runs instead */
++	bool live;			/* set while the redirect is in place */
++	bool pending;			/* armed and not taken back, counted by hk_redir_pending */
++	struct hk_kretprobe retprobe;	/* the completion signal, pinned hooks only */
++	struct xarray tasks;		/* the per task marker, task guard only */
++	union {
++		struct hk_inline text;
++		struct hk_kprobe kprobe;
++	} u;
++};
++
++/*
++ * both sides by name, resolved here: the cfi suffix of a replacement is not
++ * something a caller can spell, and a name is what the text route judges an entry by
++ */
++int hk_redir_install(struct hk_redir *r, const char *sym, const char *repl_sym,
++		     enum hk_redir_how how);
++/*
++ * both sides by address, nothing resolved. only the kprobe route takes this: the
++ * text route patches an entry it has to judge and relocate by name
++ */
++int hk_redir_install_at(struct hk_redir *r, unsigned long addr,
++			unsigned long repl, enum hk_redir_how how);
++/*
++ * take it back. the text route disables the entry, waits one tasks rcu grace
++ * period and frees its trampoline, and a hook whose entry could not be restored
++ * stays live and counted by hk_inline_pending. the kprobe route unregisters the
++ * probe, lets the calls that are still inside a replacement come back, then drops
++ * the marker and the completion signal of a pinned hook. anything that could not
++ * be taken back stays armed, is counted by hk_redir_pending and hk_kprobe_pending,
++ * and is refused by the exit path, so a second call is allowed and retries what is
++ * left. the waits are short and bounded: a replacement that never returns is
++ * reported, not waited for
++ */
++int hk_redir_remove(struct hk_redir *r);
++
++/*
++ * what a consumer compiles in is its own build decision. setting the flag leaves
++ * this module out of the link, and the calls the core makes into it become
++ * nothing, while the entry points of the module itself stay declared: calling one
++ * of those without its object is a link error, never a silent no op
++ */
++#ifdef HK_NO_REDIR
++static inline unsigned int hk_redir_pending(void) { return 0; }
++static inline unsigned int hk_redir_inflight(void) { return 0; }
++#else
++/* redirects the exit path refuses to unload over: what could not be taken back */
++unsigned int hk_redir_pending(void);
++/* calls inside a replacement right now, pinned hooks only */
++unsigned int hk_redir_inflight(void);
++#endif
++
++/*
++ * the task marker of the kprobe route. the handler this library installs calls the
++ * enter half, a replacement calls the leave half. false from enter means the call
++ * is a nested one and runs the original, which is what a handler returns 0 for.
++ * the caller marker keeps no state, so both halves do nothing for it
++ */
++bool hk_redir_guard_enter(struct hk_redir *r);
++void hk_redir_leave(struct hk_redir *r);
++#endif
+diff --git a/glue/hk/hk_sighook.c b/glue/hk/hk_sighook.c
+new file mode 100644
+index 0000000..695e240
+--- /dev/null
++++ b/glue/hk/hk_sighook.c
+@@ -0,0 +1,208 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2026 dere3046
++ */
++
++#include <linux/errno.h>
++#include <linux/kprobes.h>
++#include <linux/list.h>
++#include <linux/module.h>
++#include <linux/printk.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/uaccess.h>
++
++#include "hk.h"
++#include "hk_kprobe.h"
++#include "hk_sighook.h"
++
++/* entries one delivery may fire, the lock is dropped before they run */
++#define HK_SIGHOOK_FIRE_MAX 8
++
++struct hk_sighook_entry {
++	struct list_head list;
++	unsigned long start;
++	unsigned long end;
++	hk_sighook_fn fn;
++	void *priv;
++};
++
++static LIST_HEAD(g_sighook);
++static DEFINE_SPINLOCK(g_sighook_lock);
++
++static struct hk_kprobe g_sighook_rt;
++static bool g_sighook_armed;
++
++int hk_sighook_add(unsigned long start, unsigned long end, hk_sighook_fn fn,
++		   void *priv)
++{
++	struct hk_sighook_entry *new;
++	struct hk_sighook_entry *ent;
++
++	if (!fn || end <= start)
++		return -EINVAL;
++	if (!hk_ker_addr_ok(start) || !hk_ker_addr_ok(end))
++		return -EINVAL;
++
++	new = kzalloc(sizeof(*new), GFP_KERNEL);
++	if (!new)
++		return -ENOMEM;
++
++	spin_lock(&g_sighook_lock);
++	list_for_each_entry(ent, &g_sighook, list) {
++		if (start < ent->end && ent->start < end) {
++			unsigned long other = ent->start;
++
++			spin_unlock(&g_sighook_lock);
++			kfree(new);
++			pr_warn("[lkmhook] sighook range 0x%lx conflicts with 0x%lx\n",
++				start, other);
++			return -EEXIST;
++		}
++	}
++	new->start = start;
++	new->end = end;
++	new->fn = fn;
++	new->priv = priv;
++	list_add(&new->list, &g_sighook);
++	spin_unlock(&g_sighook_lock);
++	return 0;
++}
++
++void hk_sighook_del(hk_sighook_fn fn)
++{
++	struct hk_sighook_entry *ent;
++	struct hk_sighook_entry *tmp;
++
++	if (!fn)
++		return;
++
++	spin_lock(&g_sighook_lock);
++	list_for_each_entry_safe(ent, tmp, &g_sighook, list) {
++		if (ent->fn != fn)
++			continue;
++		list_del(&ent->list);
++		spin_unlock(&g_sighook_lock);
++		kfree(ent);
++		return;
++	}
++	spin_unlock(&g_sighook_lock);
++}
++
++/*
++ * the interrupted register file of the delivery, which is argument four of
++ * setup_rt_frame. the kernel builds the signal frame around this same pointer
++ * and enters the handler with it, so editing it here is editing the handler
++ * entry state, and that is the only way to change what the handler sees
++ */
++static int hk_sighook_pre(struct kprobe *p, struct pt_regs *regs)
++{
++	struct hk_sighook_entry *fire[HK_SIGHOOK_FIRE_MAX];
++	struct hk_sighook_entry *ent;
++	struct pt_regs *user;
++	unsigned long pc;
++	unsigned int count = 0;
++	unsigned int i;
++	int signal;
++
++	(void)p;
++	user = (struct pt_regs *)hk_regs_arg(regs, 3);
++	if (!user || !hk_ker_addr_ok((unsigned long)user))
++		return 0;
++	pc = hk_regs_ip(user);
++	signal = (int)hk_regs_arg(regs, 0);
++
++	/*
++	 * the entries are collected under the lock and the consumers run after
++	 * it is dropped: a consumer may take its own lock and has to be able to
++	 * unregister itself, and the interval table is a short list
++	 */
++	spin_lock(&g_sighook_lock);
++	list_for_each_entry(ent, &g_sighook, list) {
++		if (pc < ent->start || pc >= ent->end)
++			continue;
++		if (count >= HK_SIGHOOK_FIRE_MAX) {
++			pr_warn_once("[lkmhook] sighook over %d hits in one delivery\n",
++				     HK_SIGHOOK_FIRE_MAX);
++			break;
++		}
++		fire[count++] = ent;
++	}
++	spin_unlock(&g_sighook_lock);
++
++	for (i = 0; i < count; i++) {
++		struct hk_sighook_context ctx;
++
++		ctx.signal = signal;
++		ctx.pc = pc;
++		ctx.regs = user;
++		ctx.priv = fire[i]->priv;
++		fire[i]->fn(&ctx);
++	}
++	return 0;
++}
++
++/*
++ * the dispatch target is read at install time instead of being chosen by a
++ * version test: the first instruction of a function built for this series is a
++ * landing pad or a paciasp prologue. an entry that is neither means the symbol
++ * resolved to something else, and that is worth a line before the probe is
++ * armed on it
++ */
++int hk_sighook_probe(char *out, size_t len)
++{
++	unsigned long addr;
++	u32 insn[2];
++
++	if (!out || !len)
++		return -EINVAL;
++	out[0] = 0;
++	addr = hk_resolve("setup_rt_frame");
++	if (!addr || !hk_ker_addr_ok(addr))
++		return -ENOENT;
++	if (copy_from_kernel_nofault(insn, (const void *)addr, sizeof(insn))) {
++		scnprintf(out, len, "setup_rt_frame unreadable");
++		return 0;
++	}
++	scnprintf(out, len, "setup_rt_frame 0x%lx entry %08x %08x", addr,
++		  insn[0], insn[1]);
++	return 0;
++}
++
++int hk_sighook_install(void)
++{
++	char report[96];
++	int ret;
++
++	if (g_sighook_armed)
++		return 0;
++	if (hk_sighook_probe(report, sizeof(report)))
++		scnprintf(report, sizeof(report), "setup_rt_frame unresolved");
++	pr_info("[lkmhook] sighook %s\n", report);
++
++	ret = hk_kprobe_install(&g_sighook_rt, "setup_rt_frame",
++				hk_sighook_pre);
++	if (ret) {
++		pr_warn("[lkmhook] sighook probe refused %d\n", ret);
++		return ret;
++	}
++	g_sighook_armed = true;
++	return 0;
++}
++
++void hk_sighook_exit(void)
++{
++	struct hk_sighook_entry *ent;
++	struct hk_sighook_entry *tmp;
++
++	if (g_sighook_armed) {
++		hk_kprobe_remove(&g_sighook_rt);
++		g_sighook_armed = false;
++	}
++	spin_lock(&g_sighook_lock);
++	list_for_each_entry_safe(ent, tmp, &g_sighook, list) {
++		list_del(&ent->list);
++		kfree(ent);
++	}
++	spin_unlock(&g_sighook_lock);
++}
+diff --git a/glue/hk/hk_sighook.h b/glue/hk/hk_sighook.h
+new file mode 100644
+index 0000000..b10dab9
+--- /dev/null
++++ b/glue/hk/hk_sighook.h
+@@ -0,0 +1,60 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2026 dere3046
++ */
++
++#ifndef LKMHOOK_HK_SIGHOOK_H
++#define LKMHOOK_HK_SIGHOOK_H
++
++#include <linux/types.h>
++
++struct hk_sighook_context {
++	int signal;
++	unsigned long pc;
++	struct pt_regs *regs;
++	void *priv;
++};
++
++typedef void (*hk_sighook_fn)(const struct hk_sighook_context *ctx);
++
++/*
++ * register an address interval. a process whose interrupted pc falls inside
++ * [start, end) has fn called for every signal delivered to it before the kernel
++ * builds the frame, so ctx->regs is the interrupted register file the signal
++ * will be entered with and editing it redirects the handler. the delivery runs
++ * afterwards either way
++ *
++ * intervals may not overlap, -EEXIST names the one in the way, the table is a
++ * list and has no fixed capacity. fn runs from the kprobe pre handler of the
++ * delivery path: preemption is off and sleeping is not allowed there, a
++ * consumer that has to block queues work instead. the registration alone arms
++ * nothing, hk_sighook_install registers the probes
++ */
++int hk_sighook_add(unsigned long start, unsigned long end, hk_sighook_fn fn,
++		   void *priv);
++void hk_sighook_del(hk_sighook_fn fn);
++
++/*
++ * the target of the dispatch is setup_rt_frame, and its entry is judged at
++ * runtime instead of through a compile time version test: the probe reads the
++ * first two instructions of the resolved symbol and answers whether the
++ * argument convention is the four argument one this library reads. 0 when the
++ * report was filled, -ENOENT when the symbol does not resolve
++ */
++int hk_sighook_probe(char *out, size_t len);
++
++/* register the probes, 0 when the dispatch is armed */
++int hk_sighook_install(void);
++/*
++ * what a consumer compiles in is its own build decision. setting the flag leaves
++ * this module out of the link, and the calls the core makes into it become
++ * nothing, while the entry points of the module itself stay declared: calling one
++ * of those without its object is a link error, never a silent no op
++ */
++#ifdef HK_NO_SIGHOOK
++static inline void hk_sighook_exit(void) { }
++#else
++/* unregister the probes and drop the table, called by hk_exit */
++void hk_sighook_exit(void);
++#endif
++#endif
+diff --git a/glue/shadow_hijack.c b/glue/shadow_hijack.c
+index d44dded..8d5d29f 100644
+--- a/glue/shadow_hijack.c
++++ b/glue/shadow_hijack.c
+@@ -88,6 +88,9 @@
+ #include <linux/spinlock.h>
+ 
+ #include "shadow_hook.h"
++/* [INLINE] inline 文本改写后端（替代 kprobe 陷阱） */
++int shadow_inline_install(struct shadow_hook *hook);
++void shadow_inline_remove(struct shadow_hook *hook);
+ #include "lkm4ctr_log.h"
+ 
+ #define SHADOW_HIJACK_VERSION	"1.0"
+@@ -138,7 +141,7 @@ static bool shadow_hook_quiescing;
+  * every redirect that started before the gate is visible in the in-flight
+  * count, and no non-exempt redirect can start afterward.
+  */
+-static bool shadow_hook_redirect_enter(struct shadow_hook *hook)
++static __maybe_unused bool shadow_hook_redirect_enter(struct shadow_hook *hook)
+ {
+ 	unsigned long flags;
+ 	bool entered = false;
+@@ -480,7 +483,7 @@ unsigned long shadow_hook_resolve(const char *name)
+ EXPORT_SYMBOL_GPL(shadow_hook_resolve);
+ 
+ #if defined(CONFIG_ARM64)
+-static void shadow_hook_redirect(struct pt_regs *regs, void *function)
++static __maybe_unused void shadow_hook_redirect(struct pt_regs *regs, void *function)
+ {
+ 	regs->pc = (unsigned long)function;
+ }
+@@ -491,12 +494,12 @@ static void shadow_hook_redirect(struct pt_regs *regs, void *function)
+  * before its prologue has run). On arm64 the AAPCS64 calling convention
+  * passes this in the link register (x30/regs[30]).
+  */
+-static unsigned long shadow_hook_caller_pc(const struct pt_regs *regs)
++static __maybe_unused unsigned long shadow_hook_caller_pc(const struct pt_regs *regs)
+ {
+ 	return regs->regs[30];
+ }
+ #elif defined(CONFIG_X86_64)
+-static void shadow_hook_redirect(struct pt_regs *regs, void *function)
++static __maybe_unused void shadow_hook_redirect(struct pt_regs *regs, void *function)
+ {
+ 	regs->ip = (unsigned long)function;
+ }
+@@ -506,7 +509,7 @@ static void shadow_hook_redirect(struct pt_regs *regs, void *function)
+  * the stack; at the hooked function's very first instruction regs->sp still
+  * points directly at it.
+  */
+-static unsigned long shadow_hook_caller_pc(const struct pt_regs *regs)
++static __maybe_unused unsigned long shadow_hook_caller_pc(const struct pt_regs *regs)
+ {
+ 	return *(unsigned long *)regs->sp;
+ }
+@@ -900,36 +903,6 @@ EXPORT_SYMBOL_GPL(shadow_hook_remove);
+ 
+ #else /* !(CONFIG_FUNCTION_TRACER && CONFIG_DYNAMIC_FTRACE) */
+ 
+-typedef int (*shadow_register_kprobe_t)(struct kprobe *);
+-typedef void (*shadow_unregister_kprobe_t)(struct kprobe *);
+-
+-static shadow_register_kprobe_t shadow_register_kprobe_fn;
+-static shadow_unregister_kprobe_t shadow_unregister_kprobe_fn;
+-
+-static bool shadow_hook_kprobe_api_ready(void)
+-{
+-	if (!shadow_register_kprobe_fn)
+-		shadow_register_kprobe_fn = (shadow_register_kprobe_t)
+-			shadow_hook_resolve("register_kprobe");
+-	if (!shadow_unregister_kprobe_fn)
+-		shadow_unregister_kprobe_fn = (shadow_unregister_kprobe_t)
+-			shadow_hook_resolve("unregister_kprobe");
+-	return shadow_register_kprobe_fn && shadow_unregister_kprobe_fn;
+-}
+-
+-static int __nocfi shadow_hook_register_kprobe(struct kprobe *kp)
+-{
+-	if (!shadow_hook_kprobe_api_ready())
+-		return -ENOENT;
+-	return shadow_register_kprobe_fn(kp);
+-}
+-
+-static void __nocfi shadow_hook_unregister_kprobe(struct kprobe *kp)
+-{
+-	if (shadow_hook_kprobe_api_ready())
+-		shadow_unregister_kprobe_fn(kp);
+-}
+-
+ /*
+  * --- kprobe pre_handler backend -----------------------------------------
+  *
+@@ -949,50 +922,6 @@ static void __nocfi shadow_hook_unregister_kprobe(struct kprobe *kp)
+  * fully described by the kprobes documentation's "jump/int3 based
+  * probing" and "pre_handler return value" semantics.
+  */
+-static int shadow_hook_pre_handler(struct kprobe *p, struct pt_regs *regs)
+-{
+-	struct shadow_hook *hook = container_of(p, struct shadow_hook, kp);
+-
+-	/*
+-	 * The kprobe sits at the very first instruction of the hooked
+-	 * function, so it also fires again when *our own* replacement
+-	 * (hook->function) calls through hook->original -- which is simply
+-	 * the same hooked address -- to invoke genuine kernel behaviour.
+-	 * Without this check, that pass-through call would be redirected
+-	 * straight back into hook->function, recursing until the kernel
+-	 * stack overflows.
+-	 *
+-	 * Mirror the ftrace backend's within_module(parent_ip, hook->owner)
+-	 * guard (see shadow_hook_thunk() above) using the caller's return
+-	 * address, which is available at function entry (in the link
+-	 * register on arm64, or on the stack on x86-64) before any prologue
+-	 * instructions have executed. hook->owner is the merged lkm4ctr.ko
+-	 * module that owns the replacement function making the pass-through
+-	 * call.
+-	 * If the call came from that module, return 0 to tell the kprobes
+-	 * core the pre_handler has *not* taken over: it will single-step the
+-	 * original (untouched) instruction and resume normal execution, i.e.
+-	 * genuinely fall through into the target function's real body.
+-	 * Otherwise (a fresh, external call) redirect: return 1, which tells
+-	 * kprobes we have fully handled the trap ourselves (regs->pc/ip
+-	 * already points at hook->function) and the replaced instruction must
+-	 * not be single-stepped.
+-	 *
+-	 * shadow_hook_redirect_enter() serializes the quiesce check,
+-	 * try_module_get(), and in-flight accounting. A successful redirect holds
+-	 * the module reference until the return probe runs; if entry is rejected,
+-	 * fall through to genuine kernel behaviour (return 0) instead of redirecting.
+-	 */
+-	if (within_module(shadow_hook_caller_pc(regs), hook->owner))
+-		return 0;
+-
+-	if (!shadow_hook_redirect_enter(hook))
+-		return 0;
+-
+-	shadow_hook_redirect(regs, hook->function);
+-	return 1;
+-}
+-
+ int shadow_hook_install(struct shadow_hook *hook)
+ {
+ 	const char * const *name;
+@@ -1016,19 +945,19 @@ int shadow_hook_install(struct shadow_hook *hook)
+ 	if (!hook->address)
+ 		return -ENOENT;
+ 
+-	*((unsigned long *)hook->original) = hook->address;
+ 	new_retprobe = !hook->retprobe_installed;
+ 	err = shadow_hook_retprobe_install(hook);
+ 	if (err)
+ 		return err;
+ 
+-	memset(&hook->kp, 0, sizeof(hook->kp));
+-	hook->kp.addr = (kprobe_opcode_t *)hook->address;
+-	hook->kp.pre_handler = shadow_hook_pre_handler;
+-
+-	err = shadow_hook_register_kprobe(&hook->kp);
++	/*
++	 * [INLINE] 不再注册 kprobe。shadow_inline_install() 会在入口写上跳转、
++	 * 把被覆盖的指令搬进 trampoline，并把 hook->original 指向那个 trampoline，
++	 * 所以这里不能像 kprobe 后端那样把 original 设成 hook->address。
++	 */
++	err = shadow_inline_install(hook);
+ 	if (err) {
+-		pr_debug("shadow_hook: register_kprobe(%s) failed: %d\n",
++		pr_debug("shadow_hook: inline hook(%s) failed: %d\n",
+ 			 hook->resolved_name, err);
+ 		if (new_retprobe)
+ 			shadow_hook_retprobe_remove(hook);
+@@ -1051,8 +980,7 @@ void shadow_hook_remove(struct shadow_hook *hook)
+ 	if (!hook->installed)
+ 		return;
+ 
+-	shadow_hook_unregister_kprobe(&hook->kp);
+-	hook->installed = false;
++	shadow_inline_remove(hook);
+ }
+ EXPORT_SYMBOL_GPL(shadow_hook_remove);
+ 
+diff --git a/glue/shadow_hook.h b/glue/shadow_hook.h
+index 6a4e1fb..d9cdf7a 100644
+--- a/glue/shadow_hook.h
++++ b/glue/shadow_hook.h
+@@ -76,6 +76,7 @@
+ #include <linux/kernel.h>
+ #include <linux/atomic.h>
+ #include <linux/kprobes.h>
++#include "hk/hk_inline.h"
+ #include <linux/ftrace.h>
+ #include <linux/list.h>
+ #include <linux/module.h>
+@@ -170,7 +171,13 @@ struct shadow_hook {
+ #if defined(CONFIG_FUNCTION_TRACER) && defined(CONFIG_DYNAMIC_FTRACE)
+ 	struct ftrace_ops	ops;
+ #else
+-	struct kprobe		kp;
++	/*
++	 * [INLINE] 原来是 struct kprobe kp;，改成 inline 文本改写后端。
++	 * 目标内核把 CONFIG_FUNCTION_TRACER 编掉时，kprobe 是唯一能用的陷阱
++	 * 后端，但每次调用都要过一次 BRK 异常；inline 直接改写入口指令，
++	 * 没有异常开销。见 glue/shadow_inline.c 顶部的说明。
++	 */
++	struct hk_inline	inline_hook;
+ #endif
+ 	bool			installed;
+ 	struct kretprobe	retprobe;
+diff --git a/glue/shadow_inline.c b/glue/shadow_inline.c
+new file mode 100644
+index 0000000..76ee46c
+--- /dev/null
++++ b/glue/shadow_inline.c
+@@ -0,0 +1,131 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * shadow_inline.c - inline text-patch backend for the shadow_hook engine.
++ *
++ * Why this exists
++ * ---------------
++ * shadow_hijack.c picks its backend at compile time: ftrace when the target
++ * kernel has CONFIG_FUNCTION_TRACER && CONFIG_DYNAMIC_FTRACE, otherwise a
++ * kprobe pre_handler that rewrites the trapped pc. Vendor GKI kernels commonly
++ * build FUNCTION_TRACER out (this device: "CONFIG_FUNCTION_TRACER is not set"),
++ * so the kprobe path is what actually runs on stock firmware.
++ *
++ * kprobe works but it is the wrong tool here:
++ *
++ *   - every hooked call costs a BRK exception on entry, and the hook engine
++ *     also installs a kretprobe on the replacement so a second one comes back
++ *     on the way out. The hot hooks (fork/clone, copy_namespaces,
++ *     wake_up_new_task, prepare_creds) sit on the process-creation path, so
++ *     that is paid on every fork.
++ *   - the redirect is decided by a C handler that must reconstruct the
++ *     pass-through case from the caller's return address.
++ *   - a kprobe occupies the shared kprobe slot for that address, which the
++ *     KernelSU/SUSFS/vendor-module ecosystem also uses.
++ *
++ * An inline hook writes a jump over the first instructions instead: no
++ * exception, no handler, no slot. The displaced instructions are copied into a
++ * trampoline and relocated, and the trampoline address becomes the "original"
++ * that a replacement calls to reach genuine kernel behaviour. Because the
++ * trampoline entry is a distinct address, the pass-through call no longer lands
++ * on the patched prologue at all, which removes the recursion guard the other
++ * two backends need.
++ *
++ * The relocation work is not new: glue/hk/ is the same engine devtmpfs_lkm has
++ * been shipping (instruction decoding, BTI landing-pad handling, text write via
++ * the kernel's own patching primitive, and an audit pass over the trampoline
++ * bounds). It is vendored here rather than reimplemented.
++ *
++ * Only two addresses are needed, so hk_inline_hook_addr() is used instead of
++ * the symbol-name entry point: shadow_hook already resolved the target (with
++ * fallback across several candidate names, which the engine cannot do), and the
++ * replacement is a static function inside this module whose name the kernel's
++ * kallsyms may not carry.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++
++#include "shadow_hook.h"
++#include "hk/hk.h"
++#include "hk/hk_inline.h"
++
++/* hk_init() must run once, before the first hook is applied. */
++static DEFINE_MUTEX(shadow_inline_init_lock);
++static bool shadow_inline_ready;
++
++static unsigned long shadow_inline_resolve_cb(const char *name)
++{
++	return shadow_hook_resolve(name);
++}
++
++static int shadow_inline_init_once(void)
++{
++	static const struct hk_cfg cfg = {
++		.resolve = shadow_inline_resolve_cb,
++		.write = NULL,	/* 用内核自己的文本写入原语 */
++	};
++	int err = 0;
++
++	mutex_lock(&shadow_inline_init_lock);
++	if (!shadow_inline_ready) {
++		err = hk_init(&cfg);
++		/* -EALREADY：别的子系统已经初始化过引擎，等同成功 */
++		if (err && err != -EALREADY)
++			pr_err("shadow_inline: hk_init failed: %d\n", err);
++		else {
++			if (err == -EALREADY)
++				err = 0;
++			shadow_inline_ready = true;
++		}
++	}
++	mutex_unlock(&shadow_inline_init_lock);
++	return err;
++}
++
++/*
++ * hook->address 已被 shadow_hijack.c 解析好，hook->function 是替换函数。
++ * 成功后 hook->original 指向 trampoline，而不是被改写的入口地址 —— 这正是
++ * inline 后端与另外两个后端的区别：替换函数调用 original 时执行的是被搬走
++ * 的原始指令，不会再落回补丁点，因此不需要递归保护。
++ */
++int shadow_inline_install(struct shadow_hook *hook)
++{
++	int err;
++
++	if (!hook || !hook->address || !hook->function || !hook->original)
++		return -EINVAL;
++	if (hook->installed)
++		return 0;
++
++	err = shadow_inline_init_once();
++	if (err)
++		return err;
++
++	err = hk_inline_hook_addr(&hook->inline_hook,
++				  hook->resolved_name ? hook->resolved_name : "hook",
++				  hook->address,
++				  (unsigned long)hook->function);
++	if (err) {
++		pr_warn("shadow_inline: hook %s failed: %d\n",
++			hook->resolved_name ? hook->resolved_name : "?", err);
++		return err;
++	}
++
++	*(unsigned long *)hook->original = hook->inline_hook.orig;
++	hook->installed = true;
++	return 0;
++}
++
++void shadow_inline_remove(struct shadow_hook *hook)
++{
++	if (!hook || !hook->installed)
++		return;
++
++	hk_inline_disable(&hook->inline_hook);
++	hk_inline_free(&hook->inline_hook);
++
++	/* 还原成"直接调用真实函数"，避免卸载后 original 指向已释放的 trampoline */
++	*(unsigned long *)hook->original = hook->address;
++	hook->installed = false;
++}
+\ No newline at end of file
+diff --git a/vendor/Makefile b/vendor/Makefile
+index 89608a3..37a26b8 100644
+--- a/vendor/Makefile
++++ b/vendor/Makefile
+@@ -26,6 +26,18 @@ lkm4ctr-objs := \
+ 	../glue/helper.sh.o \
+ 	../glue/readme.txt.o \
+ 	../glue/shadow_hijack.o \
++	../glue/shadow_inline.o \
++	../glue/hk/hk.o \
++	../glue/hk/hk_patch.o \
++	../glue/hk/hk_inline.o \
++	../glue/hk/hk_ptr.o \
++	../glue/hk/hk_ksym.o \
++	../glue/hk/hk_cfi.o \
++	../glue/hk/hk_redir.o \
++	../glue/hk/hk_kprobe.o \
++	../glue/hk/hk_kretprobe.o \
++	../glue/hk/hk_sighook.o \
++	../glue/hk/hk_flush.o \
+ 	kernel/utsname.o \
+ 	kernel/nsproxy.o \
+ 	kernel/pid_namespace.o \
