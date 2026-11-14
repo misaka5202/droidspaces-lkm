@@ -575,7 +575,6 @@ static void __nocfi cpu_tick(struct work_struct *w)
 	xa_for_each(&cpu_xa, idx, p) {
 		u64 quota = atomic64_read(&p->quota_us);
 		u64 period = atomic64_read(&p->period_us);
-		u64 used;
 		u64 wstart;
 		struct cgroup *cgrp = (struct cgroup *)idx;
 
@@ -640,7 +639,6 @@ static void __nocfi cpu_tick(struct work_struct *w)
 
 			wused = total >= wbase ? total - wbase : 0;
 			atomic64_set(&p->used_us, wused);
-			used = wused;
 
 			if (cpu_debug) {
 				/* 每个 cgroup 独立节流打印 */
