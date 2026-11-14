@@ -1,3 +1,93 @@
+diff --git a/glue/vendor_kernel_syscalls.c b/glue/vendor_kernel_syscalls.c
+index 12cf435..fb1bf74 100644
+--- a/glue/vendor_kernel_syscalls.c
++++ b/glue/vendor_kernel_syscalls.c
+@@ -8,6 +8,7 @@
+ #include <linux/uaccess.h>
+ #include <linux/capability.h>
+ #include <linux/sched/task.h>
++#include <linux/fs_context.h>
+ #include <linux/sched/signal.h>
+ #include <linux/pid.h>
+ #include <linux/pid_namespace.h>
+@@ -102,6 +103,9 @@ static const char * const vendor_kernel_copy_namespaces_names[] = {
+ static const char * const vendor_kernel_copy_creds_names[] = {
+ 	"copy_creds", NULL,
+ };
++static const char * const vendor_kernel_mount_capable_names[] = {
++	"mount_capable", NULL,
++};
+ 
+ #if defined(CONFIG_ARM64)
+ static unsigned long vns_sys_arg0(const struct pt_regs *regs) { return regs->regs[0]; }
+@@ -523,6 +527,59 @@ void vns_native___put_user_ns(struct user_namespace *ns)
+ 		real___put_user_ns(ns);
+ }
+ 
++/*
++ * [MNT-USERNS] mount_capable() 补正。
++ *
++ * 真实内核 fs/super.c：
++ *
++ *   bool mount_capable(struct fs_context *fc)
++ *   {
++ *       if (!(fc->fs_type->fs_flags & FS_USERNS_MOUNT))
++ *           return capable(CAP_SYS_ADMIN);
++ *       return ns_capable(fc->user_ns, CAP_SYS_ADMIN);
++ *   }
++ *
++ * 而 alloc_fs_context()（fs/fs_context.c）里的
++ *
++ *   fc->user_ns = get_user_ns(fc->cred->user_ns);
++ *
++ * 在 CONFIG_USER_NS=n 下被编成 "= &init_user_ns"（get_user_ns() 的
++ * 该配置分支直接忽略参数），于是 fc->user_ns 永远是 init。tmpfs / proc /
++ * ramfs 都带 FS_USERNS_MOUNT，于是走到 ns_capable(init, CAP_SYS_ADMIN)，
++ * 而调用方的 cred 处在子 user namespace（level 1），cap_capable()
++ * 直接返回 -EPERM —— 表现为 userns 内 tmpfs/proc 挂载失败，而 bind
++ * mount（不新建 superblock，不经过 mount_capable）在同一环境里成功。
++ *
++ * 这里只在"内核自己算错"的那一种情况下补正：fc->user_ns 仍是 init，
++ * 但当前 cred 已经在子 userns 里。符合该条件时按调用方真实 userns
++ * 重新判定一次 capability；其他情况一律用内核原本的结论，不改行为。
++ */
++static bool (*real_mount_capable)(struct fs_context *fc);
++
++static bool vendor_kernel_hook_mount_capable(struct fs_context *fc)
++{
++	bool ret;
++
++	if (!real_mount_capable)
++		return false;
++
++	ret = real_mount_capable(fc);
++	if (ret)
++		return true;
++
++	if (fc && fc->user_ns == vns_real_init_user_ns) {
++		struct user_namespace *cur = vns_current_user_ns();
++
++		if (cur && cur != vns_real_init_user_ns)
++			return ns_capable(cur, CAP_SYS_ADMIN);
++	}
++	return false;
++}
++
++static struct shadow_hook vendor_kernel_mount_capable_hook =
++	SHADOW_HOOK(vendor_kernel_mount_capable_names,
++		    vendor_kernel_hook_mount_capable, &real_mount_capable);
++
+ static struct shadow_hook vendor_kernel_unshare_hook =
+ 	SHADOW_HOOK(vendor_kernel_unshare_names, vendor_kernel_hook_unshare, &real_sys_unshare);
+ static struct shadow_hook vendor_kernel_setns_hook =
+@@ -603,6 +660,7 @@ struct shadow_hook *vendor_kernel_core_hooks[] = {
+ 	&vendor_kernel_put_user_ns_hook,
+ 	&vendor_kernel_copy_namespaces_hook,
+ 	&vendor_kernel_copy_creds_hook,
++	&vendor_kernel_mount_capable_hook,
+ 	NULL,
+ };
+ 
 diff --git a/vendor/kernel/nsproxy.c b/vendor/kernel/nsproxy.c
 index 31d9e2a..02d8049 100644
 --- a/vendor/kernel/nsproxy.c
