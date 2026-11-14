@@ -196,6 +196,7 @@ jobs:
           set -euo pipefail
           rm -rf /tmp/src
           mkdir -p /tmp/src
+          # 1) 上游 lkm4ctr + 本地补丁
           if git clone --depth=1 --branch "${{ inputs.upstream_ref }}" \
                https://github.com/cyanmint/lkm4ctr.git /tmp/src/lkm4ctr 2>/dev/null; then
             :
@@ -207,9 +208,9 @@ jobs:
               [ -f "$p" ] && git -C /tmp/src/lkm4ctr apply "PWD/$p" 2>/dev/null || true
             done
           fi
-          cp -a extra /tmp/src/extra
-          cp -a ksu /tmp/src/ksu
-          cp README.md /tmp/src/ 2>/dev/null || true
+          rm -rf /tmp/src/lkm4ctr/.git
+          # 2) 本仓库全部内容（构建脚本、补丁、文档、update.json 都在里面）
+          tar cf - --exclude=.git --exclude=dist --exclude=out . | ( cd /tmp/src && tar xf - )
           tar czf dist/source-$(date +%Y%m%d).tar.gz -C /tmp/src .
           ls -lh dist/source-*.tar.gz
 
