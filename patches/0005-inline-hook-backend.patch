@@ -428,10 +428,10 @@ index 0000000..08d0d2f
 +.size hk_flush_icache, . - hk_flush_icache
 diff --git a/glue/hk/hk_inline.c b/glue/hk/hk_inline.c
 new file mode 100644
-index 0000000..9a326b4
+index 0000000..ecd46f7
 --- /dev/null
 +++ b/glue/hk/hk_inline.c
-@@ -0,0 +1,1508 @@
+@@ -0,0 +1,1585 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Copyright (C) 2026 dere3046
@@ -1052,15 +1052,106 @@ index 0000000..9a326b4
 + *
 + * 分配失败（空洞不够）就退回原来的 VMALLOC 区间分配。
 + */
-+#define HK_NEAR_MASK	0x7ffffffUL	/* 128MB，b 的量程 */
-+#define HK_NEAR_TRIES	4
++#define HK_NEAR_MASK	0x7ffffffUL	/* b 的量程 ±128MB */
++#define HK_NEAR_SLACK	SZ_16M		/* 保守留 16MB 余量，实际只用 ±112MB */
++
++/* 距离是否在 b 的量程内（有符号比较） */
++static bool hk_branch_reachable(unsigned long from, unsigned long to)
++{
++	long d = (long)to - (long)from;
++
++	return d > -(long)(HK_NEAR_MASK - HK_NEAR_SLACK) &&
++	       d <  (long)(HK_NEAR_MASK - HK_NEAR_SLACK);
++}
++
++/*
++ * [安全] 内核镜像的虚拟地址范围。
++ *
++ * vmalloc 的 vmap 树只跟踪"由 vmap 分配的"区域，内核镜像那些静态映射它
++ * 并不知道。所以把搜索窗口交给 __vmalloc_node_range 之前必须先夹住，否则
++ * 分配器会把镜像所在的地址当成空闲直接分出去 —— 我们的 trampoline 就会
++ * 覆盖正在执行的内核代码。
++ */
++static bool hk_image_bounds(unsigned long *img_start, unsigned long *img_end)
++{
++	static unsigned long cached_start, cached_end;
++	static bool cached;
++
++	if (!cached) {
++		unsigned long s = hk_resolve("_text");
++		unsigned long e = hk_resolve("_end");
++
++		if (!s)
++			s = hk_resolve("_stext");
++		if (!e)
++			e = hk_resolve("__bss_stop");
++		if (!s || !e || e <= s || !hk_ker_addr_ok(s) || !hk_ker_addr_ok(e))
++			return false;
++		cached_start = s;
++		cached_end = e;
++		cached = true;
++	}
++	*img_start = cached_start;
++	*img_end = cached_end;
++	return true;
++}
++
++/*
++ * [B-RANGE] 直接在目标附近找可执行内存。
++ * 候选窗口由近到远、上下两个方向都试；拿到且够得着才收。
++ */
++static __nocfi noinline void *hk_exec_alloc_near(hk_vmalloc_node_range_fn fn,
++						 unsigned long near,
++						 unsigned long size)
++{
++	static const unsigned long edges[] = {
++		SZ_4M, SZ_16M, SZ_64M, HK_NEAR_MASK - HK_NEAR_SLACK,
++	};
++	unsigned long img_s = 0, img_e = 0;
++	int i;
++
++	for (i = 0; i < (int)ARRAY_SIZE(edges); i++) {
++		unsigned long span = edges[i];
++		int dir;
++
++		for (dir = 0; dir < 2; dir++) {
++			unsigned long lo, hi;
++			void *mem;
++
++			if (dir == 0) {
++				lo = near - span;
++				hi = near - SZ_4K;
++				/* 别碰镜像：窗口上界压到镜像起点 */
++				if (hk_image_bounds(&img_s, &img_e) && hi > img_s)
++					hi = img_s;
++			} else {
++				lo = near + SZ_4K;
++				hi = near + span;
++				/* 别碰镜像：窗口下界抬到镜像终点 */
++				if (hk_image_bounds(&img_s, &img_e) && lo < img_e)
++					lo = img_e;
++			}
++			if (lo >= hi)
++				continue;
++			mem = fn(size, 1, lo, hi,
++				 GFP_KERNEL | __GFP_NOWARN, PAGE_KERNEL_EXEC,
++				 VM_FLUSH_RESET_PERMS, NUMA_NO_NODE,
++				 __builtin_return_address(0));
++			if (mem) {
++				if (hk_branch_reachable(near, (unsigned long)mem))
++					return mem;
++				vfree(mem);
++			}
++		}
++	}
++	return NULL;
++}
 +
 +static __nocfi noinline void *hk_exec_alloc(unsigned long near, unsigned long size)
 +{
 +	hk_vmalloc_node_range_fn fn;
 +	const char *name = "__vmalloc_node_range";
-+	void *mem = NULL;
-+	int i;
++	void *mem;
 +
 +#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 +	name = "__vmalloc_node_range_noprof";
@@ -1070,25 +1161,10 @@ index 0000000..9a326b4
 +		return NULL;
 +
 +	if (near) {
-+		unsigned long lo = near - (HK_NEAR_MASK - SZ_16M);	/* -112MB */
-+		unsigned long hi = near - SZ_4M;			/* -4MB  */
-+
-+		for (i = 0; i < HK_NEAR_TRIES && !mem; i++) {
-+			mem = fn(size, 1, lo, hi,
-+				 GFP_KERNEL | __GFP_NOWARN, PAGE_KERNEL_EXEC,
-+				 VM_FLUSH_RESET_PERMS, NUMA_NO_NODE,
-+				 __builtin_return_address(0));
-+			/* 换个更靠近目标的小区间再试一次 */
-+			hi = lo + (hi - lo) / 2;
-+		}
-+		/* 够得着才留 */
-+		if (mem && ((unsigned long)mem - near + HK_NEAR_MASK) > (2 * HK_NEAR_MASK)) {
-+			vfree(mem);
-+			mem = NULL;
-+		}
++		mem = hk_exec_alloc_near(fn, near, size);
++		if (mem)
++			return mem;
 +	}
-+	if (mem)
-+		return mem;
 +
 +	return fn(size, 1, VMALLOC_START, VMALLOC_END,
 +		  GFP_KERNEL | __GFP_NOWARN, PAGE_KERNEL_EXEC,
@@ -1432,7 +1508,7 @@ index 0000000..9a326b4
 +	 * [B-RANGE] trampoline 落在 b 的量程内就只改写 1 条指令（4 字节 b），
 +	 * 否则退回 5 条指令窗口 + 20 字节绝对跳转桩。
 +	 */
-+	near_ok = ((mem > addr) ? (mem - addr) : (addr - mem)) <= HK_NEAR_MASK;
++	near_ok = hk_branch_reachable(addr, mem);
 +	h->window = near_ok ? 4 : HK_INLINE_PATCH_LEN;
 +
 +	tramp[0] = HK_INS_BTI_JC;
@@ -1940,6 +2016,7 @@ index 0000000..9a326b4
 +	out->reason = "no branch stub found";
 +	return 0;
 +}
++
 diff --git a/glue/hk/hk_inline.h b/glue/hk/hk_inline.h
 new file mode 100644
 index 0000000..cdc5e12

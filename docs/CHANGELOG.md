@@ -1,5 +1,39 @@
 # Changelog
 
+## v1.0.3
+
+Finishes the inline hook backend and closes two hazards in the code that
+enables it. Compile-verified only: the handset was offline for this release.
+
+### Everything goes inline
+
+v1.0.2 shipped a hybrid: inline where the trampoline landed within a `b`'s
+reach, kprobe otherwise. The near allocation was too narrow -- it only searched
+a few windows below the target and its distance test was written in unsigned
+arithmetic. It now searches both directions at four distances (4MB, 16MB, 64MB,
+112MB), keeps an allocation only if `hk_branch_reachable()` accepts it, and
+otherwise falls back to the absolute detour and then to kprobe. With the
+4-byte-window path working, syscall wrappers that previously had to fall back
+(`__arm64_sys_msgget` and its siblings) install inline too.
+
+### Hazards fixed in the near allocator
+
+- **The search window could land on the kernel image.** vmalloc's vmap tree only
+  tracks regions vmap itself handed out; the kernel image's static mapping is
+  invisible to it, so `__vmalloc_node_range` will happily return pages inside
+  `_text.._end` if asked. A trampoline there would overwrite live kernel code.
+  Windows are now clamped to stop at `_text` from below and start at `_end` from
+  above.
+- The unsigned distance comparison is replaced with a signed
+  `hk_branch_reachable()`, which is what the value means.
+
+### Build fix
+
+`hk_patch.c` declared `pte_t old` / `bool was_ro` after a statement, which
+android12-5.10 / 13-5.10 / 13-5.15 / 14-5.15 reject under
+`-Wdeclaration-after-statement`. Those four KMIs silently lost `lkm4ctr` while
+the job still reported success.
+
 ## v1.0.2
 
 The hook engine no longer runs on kprobe on stock firmware. Same functionality,

@@ -1,7 +1,7 @@
 id=droidspaces_lkm
 name=Droidspaces LKM
-version=v1.0.2
-versionCode=10002
+version=v1.0.3
+versionCode=10003
 author=misaka5202
 description=Container support for stock GKI kernels: namespaces, devtmpfs, macvlan, IPv6 NAT, render node, CPU and PID limits. Seven modules, autoloaded.
 updateJson=https://raw.githubusercontent.com/misaka5202/droidspaces-lkm/master/update.json
